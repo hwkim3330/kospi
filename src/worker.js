@@ -235,6 +235,7 @@ button{font-family:var(--font);cursor:pointer}
   background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
   padding:10px 12px;transition:.15s;position:relative;overflow:hidden;
 }
+a.c{display:block;text-decoration:none;color:inherit}
 .c:hover{background:var(--bg-card-h)}
 .c-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
 .c-name{font-size:10px;font-weight:600;color:var(--text-m);display:flex;align-items:center;gap:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -279,6 +280,7 @@ button{font-family:var(--font);cursor:pointer}
   background:var(--bg-card);border:1px solid var(--border);border-radius:8px;
   padding:9px 12px;font-size:12px;transition:.15s;
 }
+a.rank-row{text-decoration:none;color:inherit}
 .rank-row:hover{background:var(--bg-card-h)}
 .rank-num{font-size:10px;font-weight:800;color:var(--text-m);width:16px;text-align:center;flex-shrink:0}
 .rank-name{flex:1;font-weight:600;color:var(--text-s);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -547,12 +549,12 @@ function renderThemes(themes){
   const el=document.getElementById('themeList');
   el.innerHTML=themes.slice(0,10).map((t,i)=>{
     const isUp=t.change.startsWith('+');
-    return '<div class="rank-row fi">'
+    return '<a class="rank-row fi" href="https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no='+t.no+'" target="_blank" rel="noopener">'
       +'<span class="rank-num">'+(i+1)+'</span>'
       +'<span class="rank-name">'+esc(t.name)+'</span>'
       +'<span class="rank-detail"><span class="u">'+t.up+'</span><span class="d">'+t.down+'</span></span>'
       +'<span class="rank-chg '+(isUp?'up':'down')+'">'+esc(t.change)+'</span>'
-      +'</div>';
+      +'</a>';
   }).join('');
 }
 
@@ -562,12 +564,12 @@ function renderSectors(sectors){
   const el=document.getElementById('sectorList');
   el.innerHTML=sectors.slice(0,10).map((s,i)=>{
     const isUp=s.change.startsWith('+');
-    return '<div class="rank-row fi">'
+    return '<a class="rank-row fi" href="https://finance.naver.com/sise/sise_group_detail.naver?type=upjong&no='+s.no+'" target="_blank" rel="noopener">'
       +'<span class="rank-num">'+(i+1)+'</span>'
       +'<span class="rank-name">'+esc(s.name)+'</span>'
       +'<span class="rank-detail"><span class="u">'+s.up+'</span><span class="d">'+s.down+'</span></span>'
       +'<span class="rank-chg '+(isUp?'up':'down')+'">'+esc(s.change)+'</span>'
-      +'</div>';
+      +'</a>';
   }).join('');
 }
 
@@ -598,11 +600,32 @@ function mkCard(d,lg){
   const dec=d.price>=10000?0:d.price>=100?2:d.price>=1?2:4;
   const spark=d.sparkline&&d.sparkline.length>2?mkSpark(d.sparkline,dir):'';
   const session=d.marketClosed?'<span class="c-session closed">마감</span>':'<span class="c-session live">LIVE</span>';
-  return '<div class="c '+(lg?'c-lg ':'')+dir+' fi">'
+  const link=cardLink(d.symbol);
+  const tag=link?'a href="'+link+'" target="_blank" rel="noopener"':'div';
+  const etag=link?'a':'div';
+  return '<'+tag+' class="c '+(lg?'c-lg ':'')+dir+' fi">'
     +'<div class="c-top"><span class="c-name">'+esc(d.nameKr||d.name)+(d.name&&d.name!==(d.nameKr||d.name)?' <span class="kr">'+esc(d.name)+'</span>':'')+'</span>'+session+'</div>'
     +'<div class="c-val">'+fn(d.price,dec)+'</div>'
     +'<div class="c-chg"><span>'+arr+' '+fc(d.change,dec)+'</span><span class="pct">('+fp(d.changePercent)+')</span></div>'
-    +spark+'</div>';
+    +spark+'</'+etag+'>';
+}
+
+function cardLink(sym){
+  if(!sym)return'';
+  // Korean stocks → Naver Finance
+  const m=sym.match(/^(\\d{6})\\.KS$/);
+  if(m)return'https://finance.naver.com/item/main.naver?code='+m[1];
+  // Korean indices
+  if(sym==='^KS11')return'https://finance.naver.com/sise/sise_index.naver?code=KOSPI';
+  if(sym==='^KQ11')return'https://finance.naver.com/sise/sise_index.naver?code=KOSDAQ';
+  // BTC-KRW
+  if(sym==='BTC-KRW')return'https://finance.naver.com/marketindex/exchangeDetail.naver?marketindexCd=BTC_KRW';
+  // USD/KRW
+  if(sym==='KRW=X')return'https://finance.naver.com/marketindex/exchangeDetail.naver?marketindexCd=FX_USDKRW';
+  // VIX, SOX etc → Yahoo
+  if(sym.startsWith('^'))return'https://finance.yahoo.com/quote/'+encodeURIComponent(sym);
+  // Futures, ETFs → Yahoo
+  return'https://finance.yahoo.com/quote/'+encodeURIComponent(sym);
 }
 
 function rFutures(f){
@@ -674,16 +697,27 @@ function renderMatrix(d){
   if(d.sectors&&d.sectors.length){
     h+='<div style="margin-top:10px"><div class="sec-h"><span class="sec-t">섹터별 전망</span></div>';
     d.sectors.forEach(s=>{
-      h+='<div class="rank-row fi"><span class="rank-name">'+esc(s.name)+'</span>'
-        +'<span style="font-size:9px;color:var(--text-m)">'+esc(s.outlook||'')+'</span>'
-        +'<span class="rank-chg" style="color:'+scoreColor(s.score)+'">'+s.score+'</span></div>';
+      const sig=s.signal==='up'?'▲':s.signal==='down'?'▼':'—';
+      h+='<div class="rank-row fi" style="flex-wrap:wrap"><div style="display:flex;align-items:center;gap:8px;width:100%">'
+        +'<span class="rank-name">'+esc(s.name)+'</span>'
+        +'<span style="font-size:10px;color:var(--text-m)">'+sig+'</span>'
+        +'<span class="rank-chg" style="color:'+scoreColor(s.score)+'">'+s.score+'</span></div>'
+        +(s.catalyst?'<div style="font-size:9px;color:var(--text-m);margin-top:2px;line-height:1.4;width:100%">'+esc(s.catalyst)+'</div>':'')
+        +'</div>';
     });
     h+='</div>';
   }
   if(d.risks&&d.risks.length){
     h+='<div style="margin-top:10px"><div class="sec-h"><span class="sec-t">주요 리스크</span></div>';
     d.risks.forEach(r=>{
-      h+='<div style="padding:8px 12px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);border-radius:8px;margin-bottom:3px;font-size:10px;color:var(--up);line-height:1.4" class="fi">⚠ '+esc(r.text||r.description||r)+'</div>';
+      const title=typeof r==='string'?r:(r.title||r.text||r.description||'');
+      const impact=typeof r==='object'?(r.impact||''):'';
+      const lvl=typeof r==='object'?(r.level||''):'';
+      const lvlBadge=lvl==='high'?'<span style="background:rgba(239,68,68,.15);color:var(--up);padding:1px 5px;border-radius:3px;font-size:8px;font-weight:700;margin-right:4px">HIGH</span>':'';
+      h+='<div style="padding:8px 12px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);border-radius:8px;margin-bottom:3px;font-size:10px;line-height:1.5" class="fi">'
+        +'<div style="color:var(--up);font-weight:700">'+lvlBadge+'⚠ '+esc(title)+'</div>'
+        +(impact?'<div style="color:var(--text-m);margin-top:2px;font-size:9px">'+esc(impact)+'</div>':'')
+        +'</div>';
     });
     h+='</div>';
   }
