@@ -1,1075 +1,488 @@
 // ============================================================
 // KOSPI Board — Cloudflare Worker
-// Real-time Korean & Global Market Dashboard
-// Kiwoom REST API + Yahoo Finance
+// Naver Finance API + Yahoo Finance (no Kiwoom dependency)
 // ============================================================
 
-const KIWOOM_BASE = 'https://api.kiwoom.com';
-
-// Token cache (persists within worker isolate)
-let cachedToken = null;
-let tokenExpiry = 0;
-
-// ===================== MAIN HANDLER =====================
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders() });
-    }
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors() });
 
     try {
-      const path = url.pathname;
-
-      if (path === '/' || path === '/index.html') {
-        return new Response(HTML, {
-          headers: {
-            'Content-Type': 'text/html;charset=utf-8',
-            'Cache-Control': 'public, max-age=300',
-          },
-        });
+      if (url.pathname === '/' || url.pathname === '/index.html') {
+        return new Response(HTML, { headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'public, max-age=60' } });
       }
-
-      if (path === '/api/market') {
-        const data = await getMarketData(env);
-        return jsonResp(data);
-      }
-
-      if (path === '/api/indices') {
-        const data = await getIndicesOnly(env);
-        return jsonResp(data);
-      }
-
-      if (path === '/api/ranking') {
-        const data = await getRankingOnly(env);
-        return jsonResp(data);
-      }
-
-      if (path === '/api/global') {
-        const data = await fetchGlobalData();
-        return jsonResp(data);
-      }
-
-      if (path === '/favicon.ico') {
-        return new Response(null, { status: 204 });
-      }
-
+      if (url.pathname === '/api/market') return json(await getMarketData());
+      if (url.pathname === '/favicon.ico') return new Response(null, { status: 204 });
       return new Response('Not Found', { status: 404 });
     } catch (e) {
-      return jsonResp({ error: e.message, stack: e.stack }, 500);
+      return json({ error: e.message }, 500);
     }
   },
 };
 
-// ===================== TOKEN =====================
-async function getToken(env) {
-  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+// ===================== DATA =====================
+const YAHOO = {
+  // Korean
+  kospi:      { s: '^KS11',     name: 'KOSPI',           cat: 'kr' },
+  kosdaq:     { s: '^KQ11',     name: 'KOSDAQ',          cat: 'kr' },
+  // US
+  sp500:      { s: '^GSPC',     name: 'S&P 500',         cat: 'us' },
+  nasdaq:     { s: '^IXIC',     name: 'NASDAQ',          cat: 'us' },
+  dow:        { s: '^DJI',      name: 'DOW',             cat: 'us' },
+  vix:        { s: '^VIX',      name: 'VIX',             cat: 'us' },
+  // Futures
+  nasdaqFut:  { s: 'NQ=F',     name: 'NASDAQ 100 선물',  cat: 'fut' },
+  sp500Fut:   { s: 'ES=F',     name: 'S&P 500 선물',     cat: 'fut' },
+  // Asia
+  nikkei:     { s: '^N225',     name: 'Nikkei 225',      cat: 'asia' },
+  shanghai:   { s: '000001.SS', name: 'Shanghai',        cat: 'asia' },
+  hangSeng:   { s: '^HSI',     name: 'Hang Seng',        cat: 'asia' },
+  // FX & Commodities
+  usdkrw:     { s: 'USDKRW=X', name: 'USD/KRW',         cat: 'fx' },
+  dxy:        { s: 'DX-Y.NYB', name: 'Dollar Index',     cat: 'fx' },
+  gold:       { s: 'GC=F',     name: 'Gold',             cat: 'cmd' },
+  wti:        { s: 'CL=F',     name: 'WTI',              cat: 'cmd' },
+  natgas:     { s: 'NG=F',     name: 'Natural Gas',      cat: 'cmd' },
+  // Bonds
+  us10y:      { s: '^TNX',     name: 'US 10Y',           cat: 'bond' },
+  us5y:       { s: '^FVX',     name: 'US 5Y',            cat: 'bond' },
+  us13w:      { s: '^IRX',     name: 'US 13W',           cat: 'bond' },
+};
 
-  const resp = await fetch(`${KIWOOM_BASE}/oauth2/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json;charset=UTF-8' },
-    body: JSON.stringify({
-      grant_type: 'client_credentials',
-      appkey: env.KIWOOM_APP_KEY,
-      secretkey: env.KIWOOM_APP_SECRET,
-    }),
-  });
+const NAVER_STOCKS = {
+  'NVDA.O':  '엔비디아',
+  'TSLA.O':  '테슬라',
+  'AAPL.O':  '애플',
+  'MSFT.O':  '마이크로소프트',
+  'AMZN.O':  '아마존',
+  'GOOG.O':  '구글',
+  'META.O':  '메타',
+  'TSM.N':   'TSMC',
+  'AVGO.O':  '브로드컴',
+  'AMD.O':   'AMD',
+};
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Token error ${resp.status}: ${text}`);
-  }
+async function getMarketData() {
+  const entries = Object.entries(YAHOO);
+  const naverEntries = Object.entries(NAVER_STOCKS);
 
-  const data = await resp.json();
-  cachedToken = data.token;
-  tokenExpiry = Date.now() + ((data.expires_in || 86400) - 120) * 1000;
-  return cachedToken;
-}
-
-// ===================== KIWOOM API =====================
-async function kiwoomFetch(env, resource, apiId, body) {
-  const token = await getToken(env);
-
-  const resp = await fetch(`${KIWOOM_BASE}/api/dostk/${resource}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json;charset=UTF-8',
-      'Authorization': `Bearer ${token}`,
-      'appkey': env.KIWOOM_APP_KEY,
-      'appsecret': env.KIWOOM_APP_SECRET,
-      'api-id': apiId,
-      'cont-yn': 'N',
-      'next-key': '0',
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Kiwoom ${apiId} error ${resp.status}: ${text}`);
-  }
-
-  return resp.json();
-}
-
-// ===================== DATA AGGREGATION =====================
-async function getMarketData(env) {
-  const today = getKSTDateString();
-
-  const results = await Promise.allSettled([
-    // Korean indices (ka20006)
-    kiwoomFetch(env, 'chart', 'ka20006', { inds_cd: '001', base_dt: today }),
-    kiwoomFetch(env, 'chart', 'ka20006', { inds_cd: '101', base_dt: today }),
-    kiwoomFetch(env, 'chart', 'ka20006', { inds_cd: '201', base_dt: today }),
-    // Volume ranking (ka10024)
-    kiwoomFetch(env, 'stkinfo', 'ka10024', {
-      mrkt_tp: '000', cycle_tp: '5', trde_qty_tp: '5', stex_tp: '1',
-    }),
-    // Investor daily trading by type - foreign net buy (ka10058)
-    kiwoomFetch(env, 'stkinfo', 'ka10058', {
-      strt_dt: today, end_dt: today,
-      trde_tp: '2', mrkt_tp: '001', invsr_tp: '9000', stex_tp: '1',
-    }),
-    // Investor daily trading by type - institution net buy (ka10058)
-    kiwoomFetch(env, 'stkinfo', 'ka10058', {
-      strt_dt: today, end_dt: today,
-      trde_tp: '2', mrkt_tp: '001', invsr_tp: '9999', stex_tp: '1',
-    }),
-    // Global data
-    fetchGlobalData(),
-    // Upper limit stocks (ka10017) - 상승 종목
-    kiwoomFetch(env, 'stkinfo', 'ka10017', {
-      mrkt_tp: '000', updown_tp: '2', sort_tp: '3',
-      stk_cnd: '0', trde_qty_tp: '00000', crd_cnd: '0',
-      trde_gold_tp: '0', stex_tp: '1',
-    }),
+  const [yahooResults, naverResults] = await Promise.all([
+    Promise.allSettled(entries.map(([, v]) => fetchYahoo(v.s))),
+    Promise.allSettled(naverEntries.map(([sym]) => fetchNaver(sym))),
   ]);
 
-  const [kospi, kosdaq, kospi200, ranking, foreignBuy, instBuy, global, risers] = results;
-
-  return {
-    indices: {
-      kospi: parseIndexData(kospi, 'KOSPI', '🇰🇷'),
-      kosdaq: parseIndexData(kosdaq, 'KOSDAQ', '🇰🇷'),
-      kospi200: parseIndexData(kospi200, 'KOSPI 200', '📈'),
-    },
-    ranking: parseRankingData(ranking),
-    investors: {
-      foreign: parseInvestorData(foreignBuy, '외국인'),
-      institution: parseInvestorData(instBuy, '기관'),
-    },
-    risers: parseRiserData(risers),
-    global: global.status === 'fulfilled' ? global.value : {},
-    marketStatus: getMarketStatus(),
-    updated: new Date().toISOString(),
-  };
-}
-
-async function getIndicesOnly(env) {
-  const today = getKSTDateString();
-  const results = await Promise.allSettled([
-    kiwoomFetch(env, 'chart', 'ka20006', { inds_cd: '001', base_dt: today }),
-    kiwoomFetch(env, 'chart', 'ka20006', { inds_cd: '101', base_dt: today }),
-    kiwoomFetch(env, 'chart', 'ka20006', { inds_cd: '201', base_dt: today }),
-  ]);
-  return {
-    kospi: parseIndexData(results[0], 'KOSPI', '🇰🇷'),
-    kosdaq: parseIndexData(results[1], 'KOSDAQ', '🇰🇷'),
-    kospi200: parseIndexData(results[2], 'KOSPI 200', '📈'),
-    updated: new Date().toISOString(),
-  };
-}
-
-async function getRankingOnly(env) {
-  const data = await kiwoomFetch(env, 'stkinfo', 'ka10024', {
-    mrkt_tp: '000', cycle_tp: '5', trde_qty_tp: '5', stex_tp: '1',
-  });
-  return { ranking: parseRankingData({ status: 'fulfilled', value: data }) };
-}
-
-// ===================== PARSERS =====================
-function parseIndexData(result, name, flag) {
-  if (result.status !== 'fulfilled') {
-    return { name, flag, error: true, value: 0, change: 0, changePct: 0, sparkline: [] };
-  }
-
-  const data = result.value;
-  // Try multiple response keys
-  let arr = data.inds_dt_pole_qry || data.inds_dt_pole_chart_qry || data.inds_min_pole_qry || [];
-  if (!arr.length) {
-    // Fallback: find first array with 'dt' key
-    for (const [, v] of Object.entries(data)) {
-      if (Array.isArray(v) && v.length && v[0].dt) { arr = v; break; }
-    }
-  }
-
-  if (!arr.length) {
-    return { name, flag, error: true, value: 0, change: 0, changePct: 0, sparkline: [] };
-  }
-
-  const latest = arr[0];
-  // Kiwoom API returns index values * 100 (no decimal point)
-  const cur = parseFloat(latest.cur_prc) / 100;
-  // Calculate change from previous day's data (arr[1]) since pred_close_pric may be 0
-  const prevDay = arr.length > 1 ? arr[1] : null;
-  const prev = prevDay ? parseFloat(prevDay.cur_prc) / 100 : cur;
-  const change = cur - prev;
-  const changePct = prev ? (change / prev) * 100 : 0;
-
-  const sparkline = arr
-    .slice(0, 10)
-    .reverse()
-    .map((d) => parseFloat(d.cur_prc) / 100)
-    .filter((v) => !isNaN(v));
-
-  return {
-    name,
-    flag,
-    value: cur,
-    change,
-    changePct,
-    open: parseFloat(latest.open_pric) / 100 || 0,
-    high: parseFloat(latest.high_pric) / 100 || 0,
-    low: parseFloat(latest.low_pric) / 100 || 0,
-    volume: parseInt(latest.trde_qty) || 0,
-    date: latest.dt || '',
-    sparkline,
-    error: false,
-  };
-}
-
-function parseRankingData(result) {
-  if (result.status !== 'fulfilled') return [];
-  const arr = result.value?.trde_qty_updt || [];
-
-  return arr.slice(0, 20).map((item, i) => ({
-    rank: i + 1,
-    code: item.stk_cd || '',
-    name: (item.stk_nm || '').trim(),
-    price: parseKiwoomAbs(item.cur_prc),    // Price is always positive; +/- is direction
-    change: parseKiwoomNum(item.pred_pre),   // Change keeps sign
-    changePct: parseFloat(item.flu_rt) || 0,
-    volume: parseInt(item.now_trde_qty) || 0,
-    prevVolume: parseInt(item.prev_trde_qty) || 0,
-    direction: getSigDirection(item.pred_pre_sig),
-  }));
-}
-
-function parseInvestorData(result, label) {
-  if (result.status !== 'fulfilled') return { label, stocks: [] };
-  const arr = result.value?.invsr_daly_trde_stk || [];
-  return {
-    label,
-    stocks: arr.slice(0, 10).map((item) => ({
-      code: item.stk_cd,
-      name: (item.stk_nm || '').trim(),
-      netAmount: parseKiwoomNum(item.netslmt_amt),
-      netQty: parseKiwoomNum(item.netslmt_qty),
-      price: parseKiwoomNum(item.cur_prc),
-      changePct: parseFloat(item.pre_rt) || 0,
-    })),
-  };
-}
-
-function parseRiserData(result) {
-  if (result.status !== 'fulfilled') return [];
-  const arr = result.value?.updown_pric || [];
-  return arr.slice(0, 10).map((item) => ({
-    code: item.stk_cd,
-    name: (item.stk_nm || '').trim(),
-    price: parseKiwoomAbs(item.cur_prc),
-    changePct: parseFloat(item.flu_rt) || 0,
-    volume: parseInt(item.trde_qty) || 0,
-  }));
-}
-
-function parseKiwoomNum(str) {
-  if (!str) return 0;
-  return parseFloat(String(str).replace(/[+,]/g, '')) || 0;
-}
-
-// Absolute value parser for prices (Kiwoom prefixes +/- for direction)
-function parseKiwoomAbs(str) {
-  if (!str) return 0;
-  return Math.abs(parseFloat(String(str).replace(/[+,]/g, ''))) || 0;
-}
-
-function getSigDirection(sig) {
-  if (sig === '1' || sig === '2') return 'up';
-  if (sig === '4' || sig === '5') return 'down';
-  return 'flat';
-}
-
-// ===================== GLOBAL DATA (Yahoo Finance) =====================
-async function fetchGlobalData() {
-  const symbols = {
-    sp500: { symbol: '^GSPC', name: 'S&P 500', flag: '🇺🇸' },
-    nasdaq: { symbol: '^IXIC', name: 'NASDAQ', flag: '🇺🇸' },
-    dow: { symbol: '^DJI', name: 'DOW', flag: '🇺🇸' },
-    vix: { symbol: '^VIX', name: 'VIX', flag: '📊' },
-    usdkrw: { symbol: 'USDKRW=X', name: 'USD/KRW', flag: '💱' },
-    gold: { symbol: 'GC=F', name: 'Gold', flag: '🥇' },
-    wti: { symbol: 'CL=F', name: 'WTI', flag: '🛢' },
-    dxy: { symbol: 'DX-Y.NYB', name: 'DXY', flag: '💵' },
-    nikkei: { symbol: '^N225', name: 'Nikkei 225', flag: '🇯🇵' },
-    shanghai: { symbol: '000001.SS', name: 'Shanghai', flag: '🇨🇳' },
-    us10y: { symbol: '^TNX', name: 'US 10Y', flag: '🏛' },
-    us2y: { symbol: '^IRX', name: 'US 13W', flag: '🏛' },
-  };
-
-  const results = {};
-  const entries = Object.entries(symbols);
-
-  const fetches = await Promise.allSettled(
-    entries.map(([, info]) => fetchYahoo(info.symbol))
-  );
-
+  const indicators = {};
   entries.forEach(([key, info], i) => {
-    const r = fetches[i];
+    const r = yahooResults[i];
     if (r.status === 'fulfilled' && r.value) {
-      results[key] = { ...r.value, name: info.name, flag: info.flag };
+      indicators[key] = { ...r.value, name: info.name, cat: info.cat };
     }
   });
 
-  return results;
+  const usStocks = [];
+  naverEntries.forEach(([sym, nameKr], i) => {
+    const r = naverResults[i];
+    if (r.status === 'fulfilled' && r.value) {
+      usStocks.push({ symbol: sym.split('.')[0], nameKr, ...r.value });
+    }
+  });
+
+  return { indicators, usStocks, marketStatus: getMarketStatus(), updated: new Date().toISOString() };
 }
 
 async function fetchYahoo(symbol) {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
-    const resp = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      },
-    });
-    if (!resp.ok) return null;
-
-    const data = await resp.json();
-    const meta = data?.chart?.result?.[0]?.meta;
-    if (!meta) return null;
-
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo`;
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } });
+    if (!r.ok) return null;
+    const d = await r.json();
+    const meta = d?.chart?.result?.[0]?.meta;
+    if (!meta || !meta.regularMarketPrice) return null;
     const price = meta.regularMarketPrice;
-    const prevClose = meta.previousClose || meta.chartPreviousClose;
-    if (!price || !prevClose) return null;
-
-    const change = price - prevClose;
-    const changePct = prevClose ? (change / prevClose) * 100 : 0;
-
-    const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
-    const sparkline = closes.filter((v) => v != null);
-
-    return { value: price, change, changePct, sparkline };
-  } catch {
-    return null;
-  }
+    const prev = meta.previousClose || meta.chartPreviousClose || price;
+    const change = price - prev;
+    const pct = prev ? (change / prev) * 100 : 0;
+    const closes = (d?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || []).filter(v => v != null);
+    return { value: price, change, changePct: pct, sparkline: closes.slice(-20) };
+  } catch { return null; }
 }
 
-// ===================== HELPERS =====================
-function getKSTDateString() {
-  const now = new Date();
-  const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-  return kst.toISOString().slice(0, 10).replace(/-/g, '');
+async function fetchNaver(symbol) {
+  try {
+    const r = await fetch(`https://api.stock.naver.com/stock/${symbol}/basic`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' },
+    });
+    if (!r.ok) {
+      // Fallback: try .OQ for NASDAQ stocks
+      const alt = symbol.replace('.O', '.OQ');
+      const r2 = await fetch(`https://api.stock.naver.com/stock/${alt}/basic`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' },
+      });
+      if (!r2.ok) return null;
+      const d2 = await r2.json();
+      return parseNaverStock(d2);
+    }
+    return parseNaverStock(await r.json());
+  } catch { return null; }
+}
+
+function parseNaverStock(d) {
+  const price = parseFloat((d.closePrice || d.currentPrice || '0').replace(/,/g, ''));
+  const change = parseFloat((d.compareToPreviousClosePrice || '0').replace(/,/g, ''));
+  const pct = parseFloat(d.fluctuationsRatio || 0);
+  if (!price) return null;
+  return { value: price, change, changePct: pct };
 }
 
 function getMarketStatus() {
   const now = new Date();
   const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-  const h = kst.getUTCHours();
-  const m = kst.getUTCMinutes();
-  const day = kst.getUTCDay();
-  const time = h * 60 + m;
-
-  if (day === 0 || day === 6) return { status: 'closed', label: '주말 휴장' };
-  if (time >= 540 && time <= 930) return { status: 'open', label: '장중' };
-  if (time >= 510 && time < 540) return { status: 'pre', label: '장전' };
-  if (time > 930 && time <= 960) return { status: 'after', label: '장후' };
-  if (time > 960 && time <= 1200) return { status: 'nxt', label: 'NXT 거래' };
-  return { status: 'closed', label: '장마감' };
+  const h = kst.getUTCHours(), m = kst.getUTCMinutes(), day = kst.getUTCDay();
+  const t = h * 60 + m;
+  if (day === 0 || day === 6) return { s: 'closed', l: '주말 휴장' };
+  if (t >= 540 && t <= 930) return { s: 'open', l: '장중' };
+  if (t >= 510 && t < 540) return { s: 'pre', l: '장전' };
+  if (t > 930 && t <= 960) return { s: 'after', l: '장후' };
+  return { s: 'closed', l: '장마감' };
 }
 
-function corsHeaders() {
-  return {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Max-Age': '86400',
-  };
-}
-
-function jsonResp(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      'Content-Type': 'application/json;charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'public, max-age=20',
-    },
-  });
-}
+function cors() { return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET', 'Access-Control-Max-Age': '86400' }; }
+function json(d, s = 200) { return new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=15' } }); }
 
 // ===================== HTML =====================
 const HTML = `<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>KOSPI Board</title>
-<meta name="description" content="KOSPI, KOSDAQ, 글로벌 지수 실시간 모니터링 대시보드">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>KOSPI Board - 실시간 시장 대시보드</title>
+<meta name="description" content="KOSPI, KOSDAQ, 글로벌 지수 실시간 대시보드">
+<meta name="theme-color" content="#0a0d14">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#080b14">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>📊</text></svg>">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
 <style>
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+@font-face{font-family:'Pretendard';font-weight:400;src:url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/woff2/Pretendard-Regular.woff2') format('woff2')}
+@font-face{font-family:'Pretendard';font-weight:500;src:url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/woff2/Pretendard-Medium.woff2') format('woff2')}
+@font-face{font-family:'Pretendard';font-weight:600;src:url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/woff2/Pretendard-SemiBold.woff2') format('woff2')}
+@font-face{font-family:'Pretendard';font-weight:700;src:url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/woff2/Pretendard-Bold.woff2') format('woff2')}
+@font-face{font-family:'Pretendard';font-weight:800;src:url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/woff2/Pretendard-ExtraBold.woff2') format('woff2')}
+*{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --bg-body:#080b14;
-  --bg-surface:#0e1222;
-  --bg-card:rgba(16,20,38,0.85);
-  --bg-card-hover:rgba(22,28,52,0.95);
-  --border:rgba(255,255,255,0.05);
-  --border-hover:rgba(255,255,255,0.1);
-  --text-primary:#e8eaef;
-  --text-secondary:#7c819a;
-  --text-muted:#464b64;
-  --up:#ff4757;
-  --up-bg:rgba(255,71,87,0.08);
-  --up-glow:rgba(255,71,87,0.15);
-  --down:#3b82f6;
-  --down-bg:rgba(59,130,246,0.08);
-  --down-glow:rgba(59,130,246,0.15);
+  --bg:#0a0d14;--surface:#111827;--card:#161d2e;--card-hover:#1c2540;
+  --border:rgba(255,255,255,0.06);--border-h:rgba(255,255,255,0.12);
+  --t1:#f0f2f5;--t2:#8b92a5;--t3:#4b5168;
+  --up:#ef4444;--up-bg:rgba(239,68,68,0.08);
+  --dn:#3b82f6;--dn-bg:rgba(59,130,246,0.08);
   --flat:#6b7280;
-  --accent:#8b5cf6;
-  --accent-glow:rgba(139,92,246,0.2);
-  --radius:14px;
-  --radius-sm:8px;
-  --shadow:0 4px 32px rgba(0,0,0,0.4);
-  --font-sans:'Inter',system-ui,-apple-system,sans-serif;
-  --font-mono:'JetBrains Mono','SF Mono',monospace;
+  --accent:#8b5cf6;--accent-bg:rgba(139,92,246,0.1);
+  --r:12px;--rs:8px;
+  --font:'Pretendard',-apple-system,'Segoe UI',sans-serif;
+  --mono:'SF Mono','Cascadia Mono','Consolas',monospace;
 }
-html{font-size:15px;-webkit-font-smoothing:antialiased}
-body{
-  font-family:var(--font-sans);
-  background:var(--bg-body);
-  color:var(--text-primary);
-  min-height:100vh;
-  overflow-x:hidden;
-}
-body::before{
-  content:'';position:fixed;top:0;left:0;right:0;height:600px;
-  background:radial-gradient(ellipse 80% 50% at 50% -20%,rgba(139,92,246,0.08),transparent);
-  pointer-events:none;z-index:0;
-}
+html{font-size:14px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{font-family:var(--font);background:var(--bg);color:var(--t1);min-height:100vh;min-height:100dvh}
+body::before{content:'';position:fixed;inset:0;height:500px;background:radial-gradient(ellipse 70% 40% at 50% -10%,rgba(139,92,246,0.06),transparent);pointer-events:none;z-index:0}
 
-/* Layout */
-.container{max-width:1440px;margin:0 auto;padding:0 20px;position:relative;z-index:1}
-.header{padding:28px 0 20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
-.logo{display:flex;align-items:center;gap:12px}
-.logo h1{font-size:1.5rem;font-weight:800;letter-spacing:-0.02em;background:linear-gradient(135deg,#e8eaef,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.status-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:20px;font-size:0.75rem;font-weight:600;letter-spacing:0.02em}
-.status-badge.open{background:rgba(16,185,129,0.12);color:#10b981;border:1px solid rgba(16,185,129,0.2)}
-.status-badge.closed{background:rgba(107,114,128,0.12);color:#9ca3af;border:1px solid rgba(107,114,128,0.2)}
-.status-badge.pre,.status-badge.after,.status-badge.nxt{background:rgba(245,158,11,0.12);color:#f59e0b;border:1px solid rgba(245,158,11,0.2)}
-.status-dot{width:6px;height:6px;border-radius:50%;background:currentColor}
-.status-badge.open .status-dot{animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
-.header-right{display:flex;align-items:center;gap:16px}
-.update-time{font-size:0.8rem;color:var(--text-muted);font-family:var(--font-mono)}
-.refresh-btn{
-  background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.2);
-  color:#a78bfa;border-radius:8px;padding:6px 14px;cursor:pointer;
-  font-size:0.8rem;font-weight:600;font-family:var(--font-sans);
-  transition:all 0.2s;display:flex;align-items:center;gap:6px;
-}
-.refresh-btn:hover{background:rgba(139,92,246,0.2);border-color:rgba(139,92,246,0.35)}
-.refresh-btn.loading{opacity:0.6;pointer-events:none}
-.refresh-btn svg{width:14px;height:14px}
-.refresh-btn.loading svg{animation:spin 1s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
+.wrap{max-width:1280px;margin:0 auto;padding:0 16px;position:relative;z-index:1}
 
-/* Sections */
-.section{margin-bottom:32px}
-.section-title{
-  font-size:0.85rem;font-weight:700;color:var(--text-muted);
-  text-transform:uppercase;letter-spacing:0.08em;margin-bottom:14px;
-  display:flex;align-items:center;gap:8px;
-}
-.section-title::after{content:'';flex:1;height:1px;background:var(--border)}
-
-/* Cards Grid */
-.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
-.grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
-
-/* Index Card */
-.card{
-  background:var(--bg-card);
-  border:1px solid var(--border);
-  border-radius:var(--radius);
-  padding:20px;
-  transition:all 0.25s ease;
-  position:relative;
-  overflow:hidden;
-  backdrop-filter:blur(12px);
-}
-.card:hover{
-  border-color:var(--border-hover);
-  background:var(--bg-card-hover);
-  transform:translateY(-1px);
-  box-shadow:var(--shadow);
-}
-.card.up{border-left:3px solid var(--up)}
-.card.down{border-left:3px solid var(--down)}
-.card.flat{border-left:3px solid var(--flat)}
-.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.card-name{font-size:0.85rem;font-weight:600;color:var(--text-secondary);display:flex;align-items:center;gap:6px}
-.card-flag{font-size:1rem}
-.card-badge{font-size:0.65rem;padding:2px 6px;border-radius:4px;font-weight:600;letter-spacing:0.02em}
-.card-value{
-  font-size:1.85rem;font-weight:800;letter-spacing:-0.03em;
-  font-family:var(--font-mono);line-height:1.1;margin-bottom:8px;
-  font-variant-numeric:tabular-nums;
-}
-.card-change{display:flex;align-items:center;gap:8px;font-size:0.85rem;font-weight:600;font-family:var(--font-mono)}
-.card-change .arrow{font-size:0.7rem}
-.card-change .pct{opacity:0.7}
-.card.up .card-value,.card.up .card-change{color:var(--up)}
-.card.down .card-value,.card.down .card-change{color:var(--down)}
-.card.flat .card-value{color:var(--text-primary)}
-.card.flat .card-change{color:var(--flat)}
-
-/* Sparkline */
-.sparkline{margin-top:12px;height:32px;width:100%}
-.sparkline svg{width:100%;height:100%}
-
-/* Card detail row */
-.card-details{
-  display:flex;gap:12px;margin-top:10px;padding-top:10px;
-  border-top:1px solid var(--border);font-size:0.75rem;color:var(--text-muted);
-  font-family:var(--font-mono);
-}
-.card-details span{display:flex;flex-direction:column;gap:2px}
-.card-details .label{font-size:0.65rem;color:var(--text-muted);opacity:0.7}
-
-/* Index Card (large) */
-.card-lg{padding:24px}
-.card-lg .card-value{font-size:2.2rem}
-
-/* Global small card */
-.card-sm{padding:16px}
-.card-sm .card-value{font-size:1.3rem}
-.card-sm .card-change{font-size:0.78rem}
-
-/* Table */
-.table-wrap{
-  background:var(--bg-card);border:1px solid var(--border);
-  border-radius:var(--radius);overflow:hidden;backdrop-filter:blur(12px);
-}
-.table-wrap table{width:100%;border-collapse:collapse}
-.table-wrap th{
-  font-size:0.72rem;font-weight:600;color:var(--text-muted);
-  text-transform:uppercase;letter-spacing:0.06em;
-  padding:12px 16px;text-align:left;
-  border-bottom:1px solid var(--border);
-  background:rgba(255,255,255,0.02);
-  position:sticky;top:0;
-}
-.table-wrap td{
-  padding:10px 16px;font-size:0.85rem;
-  border-bottom:1px solid rgba(255,255,255,0.025);
-  transition:background 0.15s;
-}
-.table-wrap tr:hover td{background:rgba(255,255,255,0.02)}
-.table-wrap tr:last-child td{border-bottom:none}
-.rank-cell{
-  width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;
-  border-radius:8px;font-weight:700;font-size:0.8rem;
-  background:rgba(139,92,246,0.08);color:var(--accent);
-  font-family:var(--font-mono);
-}
-.rank-cell.top3{background:rgba(245,158,11,0.1);color:#f59e0b}
-.stock-name{font-weight:600}
-.stock-code{font-size:0.72rem;color:var(--text-muted);margin-left:6px;font-family:var(--font-mono)}
-.td-price{font-family:var(--font-mono);font-weight:600;text-align:right}
-.td-change{font-family:var(--font-mono);font-weight:600;text-align:right}
-.td-volume{font-family:var(--font-mono);color:var(--text-secondary);text-align:right;font-size:0.8rem}
-.td-change.up{color:var(--up)}
-.td-change.down{color:var(--down)}
-.td-change.flat{color:var(--flat)}
-th.right{text-align:right}
-
-/* Investor section */
-.investor-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.investor-card{
-  background:var(--bg-card);border:1px solid var(--border);
-  border-radius:var(--radius);padding:20px;backdrop-filter:blur(12px);
-}
-.investor-card h3{font-size:0.9rem;font-weight:700;margin-bottom:12px;color:var(--text-secondary)}
-.investor-item{
-  display:flex;justify-content:space-between;align-items:center;
-  padding:6px 0;font-size:0.82rem;
-}
-.investor-item .name{font-weight:500}
-.investor-item .amount{font-family:var(--font-mono);font-weight:600}
-.investor-item .amount.up{color:var(--up)}
-.investor-item .amount.down{color:var(--down)}
-
-/* Footer */
-.footer{
-  padding:32px 0;margin-top:20px;
-  border-top:1px solid var(--border);
-  text-align:center;font-size:0.75rem;color:var(--text-muted);
-  line-height:1.8;
-}
-
-/* Skeleton */
-.skeleton{
-  background:linear-gradient(90deg,var(--bg-surface) 25%,rgba(255,255,255,0.04) 50%,var(--bg-surface) 75%);
-  background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:6px;
-}
-@keyframes shimmer{to{background-position:-200% 0}}
-.skel-value{height:36px;width:60%;margin-bottom:8px}
-.skel-change{height:18px;width:40%}
-.skel-row{height:44px;width:100%;margin-bottom:4px}
-
-/* Error */
-.error-card{text-align:center;padding:40px;color:var(--text-muted)}
-.error-card .icon{font-size:2rem;margin-bottom:8px}
-
-/* Responsive */
-@media(max-width:1024px){
-  .grid-4{grid-template-columns:repeat(2,1fr)}
-}
-@media(max-width:768px){
-  html{font-size:14px}
-  .container{padding:0 14px}
-  .header{padding:20px 0 16px}
-  .grid-3{grid-template-columns:1fr}
-  .grid-4{grid-template-columns:repeat(2,1fr)}
-  .grid-2{grid-template-columns:1fr}
-  .investor-grid{grid-template-columns:1fr}
-  .card-lg .card-value{font-size:1.8rem}
-  .table-wrap{overflow-x:auto}
-  .table-wrap table{min-width:600px}
-}
-@media(max-width:480px){
-  .grid-4{grid-template-columns:1fr}
-  .header-right{width:100%;justify-content:space-between}
-}
-
-/* Animations */
-.fade-in{animation:fadeIn 0.4s ease-out}
-@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.card-value.flash-up{animation:flashUp 0.6s ease}
-.card-value.flash-down{animation:flashDown 0.6s ease}
-@keyframes flashUp{0%{background:var(--up-bg)}100%{background:transparent}}
-@keyframes flashDown{0%{background:var(--down-bg)}100%{background:transparent}}
+/* Header */
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:20px 0 16px;flex-wrap:wrap;gap:10px}
+.hdr-l{display:flex;align-items:center;gap:10px}
+.hdr h1{font-size:1.35rem;font-weight:800;letter-spacing:-0.02em;background:linear-gradient(135deg,var(--t1),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:16px;font-size:0.7rem;font-weight:600}
+.badge.open{background:rgba(16,185,129,0.1);color:#10b981;border:1px solid rgba(16,185,129,0.2)}
+.badge.closed{background:rgba(107,114,128,0.1);color:#9ca3af;border:1px solid rgba(107,114,128,0.15)}
+.badge.pre,.badge.after{background:rgba(245,158,11,0.1);color:#f59e0b;border:1px solid rgba(245,158,11,0.15)}
+.dot{width:5px;height:5px;border-radius:50%;background:currentColor}
+.badge.open .dot{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.hdr-r{display:flex;align-items:center;gap:12px}
+.time{font-size:.75rem;color:var(--t3);font-family:var(--mono);font-variant-numeric:tabular-nums}
+.rbtn{background:var(--accent-bg);border:1px solid rgba(139,92,246,.2);color:#a78bfa;border-radius:var(--rs);padding:5px 12px;cursor:pointer;font-size:.75rem;font-weight:600;font-family:var(--font);transition:all .2s;display:flex;align-items:center;gap:5px}
+.rbtn:hover{background:rgba(139,92,246,.18)}
+.rbtn.spin svg{animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.rbtn svg{width:13px;height:13px}
 
 /* Tabs */
-.tabs{display:flex;gap:4px;margin-bottom:18px;flex-wrap:wrap}
-.tab{
-  padding:6px 16px;border-radius:8px;font-size:0.8rem;font-weight:600;
-  cursor:pointer;transition:all 0.2s;color:var(--text-muted);
-  border:1px solid transparent;background:transparent;
-  font-family:var(--font-sans);
-}
-.tab:hover{color:var(--text-secondary);background:rgba(255,255,255,0.03)}
-.tab.active{color:var(--accent);background:rgba(139,92,246,0.08);border-color:rgba(139,92,246,0.15)}
+.tabs{display:flex;gap:2px;padding:4px;background:var(--surface);border-radius:10px;margin-bottom:20px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tabs::-webkit-scrollbar{display:none}
+.tab{padding:7px 16px;border-radius:7px;font-size:.78rem;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .2s;color:var(--t3);border:none;background:none;font-family:var(--font)}
+.tab:hover{color:var(--t2)}
+.tab.on{color:var(--t1);background:var(--card)}
+
+/* Grid */
+.grid{display:grid;gap:10px}
+.g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+.g5{grid-template-columns:repeat(5,1fr)}
+.g2{grid-template-columns:repeat(2,1fr)}
+.sec{display:none}.sec.show{display:block}
+.sec-t{font-size:.72rem;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin:0 0 10px 4px}
+
+/* Card */
+.c{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px;transition:all .2s;position:relative;overflow:hidden;cursor:default}
+.c:hover{border-color:var(--border-h);background:var(--card-hover);transform:translateY(-1px);box-shadow:0 8px 32px rgba(0,0,0,.25)}
+.c-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.c-nm{font-size:.78rem;font-weight:600;color:var(--t2)}
+.c-sub{font-size:.62rem;color:var(--t3);font-weight:500}
+.c-val{font-size:1.7rem;font-weight:800;letter-spacing:-.03em;line-height:1.1;margin-bottom:6px;font-variant-numeric:tabular-nums}
+.c-chg{display:flex;align-items:baseline;gap:6px;font-size:.8rem;font-weight:600;font-variant-numeric:tabular-nums}
+.c-chg .p{opacity:.65;font-size:.75rem}
+.c.up .c-val,.c.up .c-chg{color:var(--up)}
+.c.dn .c-val,.c.dn .c-chg{color:var(--dn)}
+.c.flat .c-val{color:var(--t1)}.c.flat .c-chg{color:var(--flat)}
+.c.up{border-bottom:2px solid rgba(239,68,68,.3)}
+.c.dn{border-bottom:2px solid rgba(59,130,246,.3)}
+
+/* Large card */
+.c-lg{padding:20px 22px}
+.c-lg .c-val{font-size:2.1rem}
+.c-lg .c-chg{font-size:.85rem}
+.c-dt{display:flex;gap:16px;margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:.7rem;color:var(--t3);font-variant-numeric:tabular-nums}
+.c-dt span{display:flex;flex-direction:column;gap:1px}
+.c-dt .lb{font-size:.6rem;opacity:.6}
+
+/* Sparkline */
+.spark{margin-top:10px;height:28px;width:100%}
+.spark svg{width:100%;height:100%}
+
+/* US Stocks table */
+.tbl{background:var(--card);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.tbl table{width:100%;border-collapse:collapse}
+.tbl th{font-size:.68rem;font-weight:600;color:var(--t3);letter-spacing:.05em;padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);background:rgba(255,255,255,.01)}
+.tbl td{padding:9px 14px;font-size:.82rem;border-bottom:1px solid rgba(255,255,255,.02)}
+.tbl tr:last-child td{border:none}
+.tbl tr:hover td{background:rgba(255,255,255,.015)}
+.tbl .r{text-align:right}
+.tbl .sym{font-weight:700;color:var(--t1);font-family:var(--mono);font-size:.78rem}
+.tbl .knm{font-size:.72rem;color:var(--t2);margin-left:6px}
+.tbl .prc{font-weight:600;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+.tbl .chg{font-weight:600;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+.tbl .chg.up{color:var(--up)}.tbl .chg.dn{color:var(--dn)}.tbl .chg.flat{color:var(--flat)}
+
+/* Skeleton */
+.sk{background:linear-gradient(90deg,var(--surface) 25%,rgba(255,255,255,.03) 50%,var(--surface) 75%);background-size:200% 100%;animation:shm 1.5s infinite;border-radius:6px}
+@keyframes shm{to{background-position:-200% 0}}
+.sk1{height:32px;width:55%;margin-bottom:6px}.sk2{height:16px;width:35%}
+
+/* Footer */
+.ft{padding:28px 0;margin-top:24px;border-top:1px solid var(--border);text-align:center;font-size:.7rem;color:var(--t3);line-height:1.7}
+
+/* Responsive */
+@media(max-width:900px){.g4,.g5{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.g4,.g5,.g3,.g2{grid-template-columns:1fr}.c-lg .c-val{font-size:1.7rem}.hdr-r{width:100%;justify-content:space-between}.tbl{overflow-x:auto}.tbl table{min-width:480px}}
+
+.fade{animation:fi .35s ease}
+@keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
 <body>
-<div class="container">
-  <!-- Header -->
-  <header class="header">
-    <div class="logo">
+<div class="wrap">
+  <header class="hdr">
+    <div class="hdr-l">
       <h1>KOSPI Board</h1>
-      <div class="status-badge closed" id="marketStatus">
-        <span class="status-dot"></span>
-        <span id="statusLabel">--</span>
-      </div>
+      <div class="badge closed" id="badge"><span class="dot"></span><span id="bLabel">--</span></div>
     </div>
-    <div class="header-right">
-      <span class="update-time" id="updateTime">--</span>
-      <button class="refresh-btn" id="refreshBtn" onclick="loadData()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
-          <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
-        </svg>
+    <div class="hdr-r">
+      <span class="time" id="clock">--:-- KST</span>
+      <button class="rbtn" id="rbtn" onclick="load()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
         새로고침
       </button>
     </div>
   </header>
 
-  <!-- Korean Indices -->
-  <section class="section">
-    <div class="section-title">한국 시장</div>
-    <div class="grid-3" id="krIndices">
-      <div class="card card-lg"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-lg"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-lg"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
+  <nav class="tabs" id="tabs">
+    <button class="tab on" data-t="core">핵심 지표</button>
+    <button class="tab" data-t="global">글로벌 지수</button>
+    <button class="tab" data-t="fx">환율 · 원자재</button>
+    <button class="tab" data-t="bond">금리 · 채권</button>
+    <button class="tab" data-t="stock">미국 주식</button>
+  </nav>
+
+  <!-- 핵심 지표 -->
+  <section class="sec show" id="s-core">
+    <div class="sec-t">한국 시장</div>
+    <div class="grid g3" id="kr" style="margin-bottom:16px">
+      <div class="c c-lg"><div class="sk sk1"></div><div class="sk sk2"></div></div>
+      <div class="c c-lg"><div class="sk sk1"></div><div class="sk sk2"></div></div>
+      <div class="c c-lg"><div class="sk sk1"></div><div class="sk sk2"></div></div>
+    </div>
+    <div class="sec-t">선물</div>
+    <div class="grid g3" id="fut">
+      <div class="c"><div class="sk sk1"></div><div class="sk sk2"></div></div>
+      <div class="c"><div class="sk sk1"></div><div class="sk sk2"></div></div>
+      <div class="c"><div class="sk sk1"></div><div class="sk sk2"></div></div>
     </div>
   </section>
 
-  <!-- Global Indices -->
-  <section class="section">
-    <div class="section-title">글로벌 지수</div>
-    <div class="grid-4" id="globalIndices">
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-    </div>
+  <!-- 글로벌 지수 -->
+  <section class="sec" id="s-global">
+    <div class="sec-t">미국</div>
+    <div class="grid g4" id="us" style="margin-bottom:16px"></div>
+    <div class="sec-t">아시아</div>
+    <div class="grid g3" id="asia"></div>
   </section>
 
-  <!-- FX & Commodities -->
-  <section class="section">
-    <div class="section-title">환율 & 원자재</div>
-    <div class="grid-4" id="fxCommodities">
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-    </div>
+  <!-- 환율 · 원자재 -->
+  <section class="sec" id="s-fx">
+    <div class="sec-t">환율</div>
+    <div class="grid g2" id="fx" style="margin-bottom:16px"></div>
+    <div class="sec-t">원자재</div>
+    <div class="grid g3" id="cmd"></div>
   </section>
 
-  <!-- Bonds -->
-  <section class="section">
-    <div class="section-title">금리 & 채권</div>
-    <div class="grid-4" id="bonds">
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-      <div class="card card-sm"><div class="skeleton skel-value"></div><div class="skeleton skel-change"></div></div>
-    </div>
+  <!-- 금리 · 채권 -->
+  <section class="sec" id="s-bond">
+    <div class="sec-t">미국 국채 금리</div>
+    <div class="grid g3" id="bond"></div>
   </section>
 
-  <!-- Tabs: Ranking / Investors -->
-  <section class="section">
-    <div class="tabs">
-      <button class="tab active" onclick="switchTab('ranking',this)">거래량 상위</button>
-      <button class="tab" onclick="switchTab('investors',this)">투자자 동향</button>
-      <button class="tab" onclick="switchTab('risers',this)">상승 종목</button>
-    </div>
-    <div id="tab-ranking">
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th style="width:50px">#</th>
-            <th>종목</th>
-            <th class="right">현재가</th>
-            <th class="right">등락률</th>
-            <th class="right">거래량</th>
-          </tr></thead>
-          <tbody id="rankingBody">
-            <tr><td colspan="5"><div class="skeleton skel-row"></div></td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-    <div id="tab-investors" style="display:none">
-      <div class="investor-grid" id="investorGrid"></div>
-    </div>
-    <div id="tab-risers" style="display:none">
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th style="width:50px">#</th>
-            <th>종목</th>
-            <th class="right">현재가</th>
-            <th class="right">등락률</th>
-          </tr></thead>
-          <tbody id="risersBody"></tbody>
-        </table>
-      </div>
-    </div>
+  <!-- 미국 주식 -->
+  <section class="sec" id="s-stock">
+    <div class="sec-t">미국 주요 종목</div>
+    <div class="tbl" id="stbl"></div>
   </section>
 
-  <!-- Footer -->
-  <footer class="footer">
+  <footer class="ft">
     <p>본 서비스는 투자 참고용 정보를 제공하며, 투자 판단에 따른 손실은 투자자 본인에게 귀속됩니다.</p>
-    <p>Data: Kiwoom Securities API &bull; Yahoo Finance &bull; Updated every 30s</p>
+    <p>Data: Yahoo Finance · Naver Finance &bull; 30초 자동 갱신</p>
   </footer>
 </div>
 
 <script>
-// ===== State =====
-let autoRefresh = true;
-let refreshTimer = null;
-let lastData = null;
+let D = null;
 
-// ===== Init =====
 document.addEventListener('DOMContentLoaded', () => {
-  loadData();
-  startAutoRefresh();
+  load();
+  setInterval(() => load(), 30000);
+  document.getElementById('tabs').addEventListener('click', e => {
+    if (!e.target.classList.contains('tab')) return;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('on'));
+    e.target.classList.add('on');
+    document.querySelectorAll('.sec').forEach(s => s.classList.remove('show'));
+    document.getElementById('s-' + e.target.dataset.t).classList.add('show');
+  });
 });
 
-function startAutoRefresh() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => { if (autoRefresh) loadData(); }, 30000);
-}
-
-// ===== Data Loading =====
-async function loadData() {
-  const btn = document.getElementById('refreshBtn');
-  btn.classList.add('loading');
-
+async function load() {
+  const b = document.getElementById('rbtn');
+  b.classList.add('spin');
   try {
-    const resp = await fetch('/api/market');
-    if (!resp.ok) throw new Error('API error ' + resp.status);
-    const data = await resp.json();
-    lastData = data;
-    render(data);
-  } catch (e) {
-    console.error('Load error:', e);
-  } finally {
-    btn.classList.remove('loading');
-  }
+    const r = await fetch('/api/market');
+    if (!r.ok) throw new Error(r.status);
+    D = await r.json();
+    render();
+  } catch(e) { console.error(e); }
+  b.classList.remove('spin');
 }
 
-// ===== Rendering =====
-function render(data) {
-  renderMarketStatus(data.marketStatus);
-  renderKRIndices(data.indices);
-  renderGlobalIndices(data.global);
-  renderFXCommodities(data.global);
-  renderBonds(data.global);
-  renderRanking(data.ranking);
-  renderInvestors(data.investors);
-  renderRisers(data.risers);
-  renderUpdateTime(data.updated);
-}
+function render() {
+  if (!D) return;
+  const ind = D.indicators || {};
+  const ms = D.marketStatus;
 
-function renderMarketStatus(ms) {
-  if (!ms) return;
-  const badge = document.getElementById('marketStatus');
-  const label = document.getElementById('statusLabel');
-  badge.className = 'status-badge ' + ms.status;
-  label.textContent = ms.label;
-}
+  // Status
+  const badge = document.getElementById('badge');
+  badge.className = 'badge ' + (ms?.s || 'closed');
+  document.getElementById('bLabel').textContent = ms?.l || '--';
 
-function renderUpdateTime(iso) {
-  const el = document.getElementById('updateTime');
-  if (!iso) return;
-  const d = new Date(iso);
-  const kst = new Date(d.getTime() + 9*60*60*1000);
-  const hh = String(kst.getUTCHours()).padStart(2,'0');
-  const mm = String(kst.getUTCMinutes()).padStart(2,'0');
-  const ss = String(kst.getUTCSeconds()).padStart(2,'0');
-  el.textContent = hh + ':' + mm + ':' + ss + ' KST';
-}
-
-function renderKRIndices(indices) {
-  if (!indices) return;
-  const el = document.getElementById('krIndices');
-  const items = [indices.kospi, indices.kosdaq, indices.kospi200];
-  el.innerHTML = items.map(idx => {
-    if (!idx || idx.error) return errorCard();
-    return indexCard(idx, true);
-  }).join('');
-}
-
-function indexCard(d, large) {
-  const dir = d.change > 0 ? 'up' : d.change < 0 ? 'down' : 'flat';
-  const arrow = d.change > 0 ? '▲' : d.change < 0 ? '▼' : '―';
-  const cls = large ? 'card card-lg fade-in ' + dir : 'card card-sm fade-in ' + dir;
-  const decimals = d.value >= 100 ? 2 : 2;
-  const sparkSVG = d.sparkline && d.sparkline.length > 1 ? makeSparkline(d.sparkline, dir) : '';
-
-  let details = '';
-  if (large && d.open) {
-    details = '<div class="card-details">'
-      + '<span><span class="label">시가</span>' + fmtNum(d.open, decimals) + '</span>'
-      + '<span><span class="label">고가</span>' + fmtNum(d.high, decimals) + '</span>'
-      + '<span><span class="label">저가</span>' + fmtNum(d.low, decimals) + '</span>'
-      + '</div>';
+  // Clock
+  if (D.updated) {
+    const d = new Date(D.updated);
+    const k = new Date(d.getTime() + 9*3600000);
+    document.getElementById('clock').textContent =
+      String(k.getUTCHours()).padStart(2,'0') + ':' +
+      String(k.getUTCMinutes()).padStart(2,'0') + ':' +
+      String(k.getUTCSeconds()).padStart(2,'0') + ' KST';
   }
 
-  return '<div class="' + cls + '">'
-    + '<div class="card-header">'
-    + '<span class="card-name"><span class="card-flag">' + (d.flag||'') + '</span>' + d.name + '</span>'
-    + '</div>'
-    + '<div class="card-value">' + fmtNum(d.value, decimals) + '</div>'
-    + '<div class="card-change">'
-    + '<span class="arrow">' + arrow + '</span>'
-    + '<span>' + fmtChange(d.change, decimals) + '</span>'
-    + '<span class="pct">(' + fmtPct(d.changePct) + ')</span>'
-    + '</div>'
-    + sparkSVG
-    + details
-    + '</div>';
+  // Korean
+  renderCards('kr', ['kospi','kosdaq','usdkrw'], ind, true);
+  // Futures
+  renderCards('fut', ['nasdaqFut','sp500Fut','vix'], ind, false);
+  // US
+  renderCards('us', ['sp500','nasdaq','dow','vix'], ind, false);
+  // Asia
+  renderCards('asia', ['nikkei','shanghai','hangSeng'], ind, false);
+  // FX
+  renderCards('fx', ['usdkrw','dxy'], ind, false);
+  // Commodities
+  renderCards('cmd', ['gold','wti','natgas'], ind, false);
+  // Bonds
+  renderCards('bond', ['us10y','us5y','us13w'], ind, false);
+  // US Stocks
+  renderStocks(D.usStocks || []);
 }
 
-function renderGlobalIndices(global) {
-  if (!global) return;
-  const el = document.getElementById('globalIndices');
-  const keys = ['sp500','nasdaq','dow','vix','nikkei','shanghai'];
+function renderCards(id, keys, ind, large) {
+  const el = document.getElementById(id);
+  if (!el) return;
   el.innerHTML = keys.map(k => {
-    const d = global[k];
-    if (!d) return emptySmallCard(k);
-    return indexCard({...d, name: d.name, flag: d.flag}, false);
+    const d = ind[k];
+    if (!d) return emptyCard(k);
+    return card(d, large);
   }).join('');
 }
 
-function renderFXCommodities(global) {
-  if (!global) return;
-  const el = document.getElementById('fxCommodities');
-  const keys = ['usdkrw','dxy','gold','wti'];
-  el.innerHTML = keys.map(k => {
-    const d = global[k];
-    if (!d) return emptySmallCard(k);
-    return indexCard({...d, name: d.name, flag: d.flag}, false);
-  }).join('');
-}
+function card(d, large) {
+  const dir = d.change > 0 ? 'up' : d.change < 0 ? 'dn' : 'flat';
+  const arrow = d.change > 0 ? '▲ ' : d.change < 0 ? '▼ ' : '';
+  const cls = large ? 'c c-lg fade ' + dir : 'c fade ' + dir;
+  const dec = getDecimals(d.value);
 
-function renderBonds(global) {
-  if (!global) return;
-  const el = document.getElementById('bonds');
-  const keys = ['us10y','us2y'];
-  el.innerHTML = keys.map(k => {
-    const d = global[k];
-    if (!d) return emptySmallCard(k);
-    return indexCard({...d, name: d.name, flag: d.flag}, false);
-  }).join('');
-}
-
-function renderRanking(ranking) {
-  if (!ranking) return;
-  const tbody = document.getElementById('rankingBody');
-  if (!ranking.length) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:24px">데이터 없음</td></tr>';
-    return;
+  let spark = '';
+  if (d.sparkline && d.sparkline.length > 2) {
+    spark = mkSparkline(d.sparkline, dir);
   }
-  tbody.innerHTML = ranking.map(s => {
-    const dir = s.direction;
-    const arrow = dir === 'up' ? '▲' : dir === 'down' ? '▼' : '';
-    const rankCls = s.rank <= 3 ? 'rank-cell top3' : 'rank-cell';
-    return '<tr class="fade-in">'
-      + '<td><span class="' + rankCls + '">' + s.rank + '</span></td>'
-      + '<td><span class="stock-name">' + s.name + '</span><span class="stock-code">' + s.code + '</span></td>'
-      + '<td class="td-price">' + fmtPrice(s.price) + '</td>'
-      + '<td class="td-change ' + dir + '">' + arrow + ' ' + fmtPct(s.changePct) + '</td>'
-      + '<td class="td-volume">' + fmtVol(s.volume) + '</td>'
-      + '</tr>';
-  }).join('');
+
+  return '<div class="' + cls + '">' +
+    '<div class="c-hd"><span class="c-nm">' + esc(d.name) + '</span></div>' +
+    '<div class="c-val">' + fmtN(d.value, dec) + '</div>' +
+    '<div class="c-chg">' + arrow + fmtC(d.change, dec) +
+    ' <span class="p">(' + fmtP(d.changePct) + ')</span></div>' +
+    spark + '</div>';
 }
 
-function renderInvestors(investors) {
-  if (!investors) return;
-  const grid = document.getElementById('investorGrid');
-  const cards = ['foreign','institution'].map(key => {
-    const inv = investors[key];
-    if (!inv || !inv.stocks || !inv.stocks.length) return '';
-    return '<div class="investor-card fade-in">'
-      + '<h3>' + inv.label + ' 순매수 TOP</h3>'
-      + inv.stocks.map(s => {
-        const dir = s.netQty > 0 ? 'up' : s.netQty < 0 ? 'down' : 'flat';
-        return '<div class="investor-item">'
-          + '<span class="name">' + s.name + '</span>'
-          + '<span class="amount ' + dir + '">' + fmtPrice(Math.abs(s.netQty)) + ' 주</span>'
-          + '</div>';
-      }).join('')
-      + '</div>';
-  });
-  grid.innerHTML = cards.join('');
+function renderStocks(stocks) {
+  const el = document.getElementById('stbl');
+  if (!stocks.length) { el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--t3)">데이터 로딩 중...</div>'; return; }
+  el.innerHTML = '<table><thead><tr><th>종목</th><th class="r">현재가 (USD)</th><th class="r">등락률</th></tr></thead><tbody>' +
+    stocks.map(s => {
+      const dir = s.changePct > 0 ? 'up' : s.changePct < 0 ? 'dn' : 'flat';
+      const arrow = s.changePct > 0 ? '▲ ' : s.changePct < 0 ? '▼ ' : '';
+      return '<tr class="fade"><td><span class="sym">' + esc(s.symbol) + '</span><span class="knm">' + esc(s.nameKr) + '</span></td>' +
+        '<td class="r prc">$' + fmtN(s.value, 2) + '</td>' +
+        '<td class="r chg ' + dir + '">' + arrow + fmtP(s.changePct) + '</td></tr>';
+    }).join('') + '</tbody></table>';
 }
 
-function renderRisers(risers) {
-  if (!risers) return;
-  const tbody = document.getElementById('risersBody');
-  if (!risers.length) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:24px">데이터 없음</td></tr>';
-    return;
-  }
-  tbody.innerHTML = risers.map((s, i) => {
-    return '<tr class="fade-in">'
-      + '<td><span class="rank-cell' + (i < 3 ? ' top3' : '') + '">' + (i+1) + '</span></td>'
-      + '<td><span class="stock-name">' + s.name + '</span><span class="stock-code">' + s.code + '</span></td>'
-      + '<td class="td-price">' + fmtPrice(s.price) + '</td>'
-      + '<td class="td-change up">▲ ' + fmtPct(s.changePct) + '</td>'
-      + '</tr>';
-  }).join('');
-}
-
-// ===== Tabs =====
-function switchTab(name, btn) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  btn.classList.add('active');
-  ['ranking','investors','risers'].forEach(id => {
-    document.getElementById('tab-' + id).style.display = id === name ? '' : 'none';
-  });
-}
-
-// ===== Sparkline =====
-function makeSparkline(data, dir) {
-  if (!data || data.length < 2) return '';
-  const w = 200, h = 32, pad = 2;
-  const min = Math.min(...data);
-  const max = Math.max(...data);
-  const range = max - min || 1;
-
-  const points = data.map((v, i) => {
-    const x = pad + (i / (data.length - 1)) * (w - pad * 2);
-    const y = h - pad - ((v - min) / range) * (h - pad * 2);
-    return x + ',' + y;
+function mkSparkline(data, dir) {
+  const w = 220, h = 28, pad = 2;
+  const mn = Math.min(...data), mx = Math.max(...data), rng = mx - mn || 1;
+  const pts = data.map((v,i) => {
+    const x = pad + (i/(data.length-1)) * (w-pad*2);
+    const y = h - pad - ((v-mn)/rng) * (h-pad*2);
+    return x+','+y;
   }).join(' ');
-
-  const color = dir === 'up' ? 'var(--up)' : dir === 'down' ? 'var(--down)' : 'var(--flat)';
-  const gradId = 'g' + Math.random().toString(36).slice(2, 8);
-
-  // Area gradient
-  const lastX = pad + (w - pad * 2);
-  const areaPoints = points + ' ' + lastX + ',' + h + ' ' + pad + ',' + h;
-
-  return '<div class="sparkline">'
-    + '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">'
-    + '<defs><linearGradient id="' + gradId + '" x1="0" y1="0" x2="0" y2="1">'
-    + '<stop offset="0%" stop-color="' + color + '" stop-opacity="0.2"/>'
-    + '<stop offset="100%" stop-color="' + color + '" stop-opacity="0"/>'
-    + '</linearGradient></defs>'
-    + '<polygon points="' + areaPoints + '" fill="url(#' + gradId + ')"/>'
-    + '<polyline points="' + points + '" fill="none" stroke="' + color + '" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'
-    + '</svg></div>';
+  const color = dir==='up' ? 'var(--up)' : dir==='dn' ? 'var(--dn)' : 'var(--flat)';
+  const gid = 'g'+Math.random().toString(36).slice(2,7);
+  const lx = pad+(w-pad*2), area = pts+' '+lx+','+h+' '+pad+','+h;
+  return '<div class="spark"><svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none">' +
+    '<defs><linearGradient id="'+gid+'" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="'+color+'" stop-opacity=".18"/><stop offset="100%" stop-color="'+color+'" stop-opacity="0"/></linearGradient></defs>' +
+    '<polygon points="'+area+'" fill="url(#'+gid+')"/>' +
+    '<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>';
 }
 
-// ===== Formatters =====
-function fmtNum(n, d) {
-  if (n == null || isNaN(n)) return '--';
-  return Number(n).toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d });
-}
-
-function fmtChange(n, d) {
-  if (n == null || isNaN(n)) return '--';
-  const prefix = n > 0 ? '+' : '';
-  return prefix + Number(n).toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d });
-}
-
-function fmtPct(n) {
-  if (n == null || isNaN(n)) return '--';
-  const prefix = n > 0 ? '+' : '';
-  return prefix + n.toFixed(2) + '%';
-}
-
-function fmtPrice(n) {
-  if (!n || isNaN(n)) return '--';
-  return Math.round(n).toLocaleString('ko-KR');
-}
-
-function fmtVol(n) {
-  if (!n) return '--';
-  if (n >= 100000000) return (n / 100000000).toFixed(1) + '억';
-  if (n >= 10000) return (n / 10000).toFixed(0) + '만';
-  return n.toLocaleString('ko-KR');
-}
-
-function errorCard() {
-  return '<div class="card card-lg"><div class="error-card"><div class="icon">⚠️</div><div>데이터 로딩 실패</div></div></div>';
-}
-
-function emptySmallCard(key) {
-  return '<div class="card card-sm"><div class="card-header"><span class="card-name">' + key + '</span></div>'
-    + '<div class="card-value" style="color:var(--text-muted)">--</div>'
-    + '<div class="card-change" style="color:var(--text-muted)">--</div></div>';
-}
+function getDecimals(v) { if (v >= 1000) return 2; if (v >= 100) return 2; if (v >= 10) return 2; return 3; }
+function fmtN(n,d) { return n == null || isNaN(n) ? '--' : Number(n).toLocaleString('ko-KR',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function fmtC(n,d) { if (n==null||isNaN(n)) return '--'; return (n>0?'+':'')+Number(n).toLocaleString('ko-KR',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function fmtP(n) { if (n==null||isNaN(n)) return '--'; return (n>0?'+':'')+n.toFixed(2)+'%'; }
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function emptyCard(k) { return '<div class="c"><div class="c-hd"><span class="c-nm">'+k+'</span></div><div class="c-val" style="color:var(--t3)">--</div><div class="c-chg" style="color:var(--t3)">--</div></div>'; }
 </script>
 </body>
 </html>`;
