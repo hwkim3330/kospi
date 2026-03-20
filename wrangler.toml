@@ -3,5 +3,9 @@ main = "src/worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+[vars]
+KIWOOM_APP_KEY = "Y4Dgfyc-Vf_JTcWxXyaq79wVbYqH-Vjdbq5J8xlWmbo"
+KIWOOM_APP_SECRET = "4o-EScMxXe481_dxTm1ReCQSEpBqP8CuK0bhBF90IO4"
+
 [observability]
 enabled = true
