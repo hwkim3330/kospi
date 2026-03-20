@@ -41,16 +41,28 @@ export default {
             const nameMap = { '005930': '삼성전자', '000660': 'SK하이닉스', '028050': '삼성E&A' };
             for (const s of (nv.datas || [])) {
               const code = s.itemCode;
-              const price = Number(String(s.closePriceRaw || s.closePrice).replace(/,/g, ''));
-              const chg = Number(String(s.compareToPreviousClosePriceRaw || s.compareToPreviousClosePrice).replace(/,/g, ''));
-              const chgPct = Number(String(s.fluctuationsRatioRaw || s.fluctuationsRatio).replace(/,/g, ''));
+              const ov = s.overMarketPriceInfo || {};
+              const isNxt = ov.overMarketStatus === 'OPEN' && (ov.tradingSessionType === 'AFTER_MARKET' || ov.tradingSessionType === 'NXT');
               const isOpen = s.marketStatus === 'OPEN';
-              // Remove existing entry from index-board if present
+              // Use NXT/after-hours price if available
+              let price, chg, chgPct, sessionTag;
+              if (isNxt && ov.overPrice) {
+                price = Number(String(ov.overPrice).replace(/,/g, ''));
+                const regClose = Number(String(s.closePriceRaw || s.closePrice).replace(/,/g, ''));
+                chg = price - regClose;
+                chgPct = regClose ? (chg / regClose) * 100 : 0;
+                sessionTag = 'nxt';
+              } else {
+                price = Number(String(s.closePriceRaw || s.closePrice).replace(/,/g, ''));
+                chg = Number(String(s.compareToPreviousClosePriceRaw || s.compareToPreviousClosePrice).replace(/,/g, ''));
+                chgPct = Number(String(s.fluctuationsRatioRaw || s.fluctuationsRatio).replace(/,/g, ''));
+                sessionTag = isOpen ? 'open' : 'closed';
+              }
               data.indicators = data.indicators.filter(i => i.symbol !== code + '.KS');
               data.indicators.push({
                 symbol: code + '.KS', name: nameMap[code] || s.stockName, nameKr: nameMap[code] || s.stockName,
                 price, change: chg, changePercent: chgPct,
-                category: 'stock', marketClosed: !isOpen,
+                category: 'stock', marketClosed: sessionTag === 'closed', sessionType: sessionTag,
               });
             }
           } catch (e) { /* ignore */ }
@@ -242,6 +254,7 @@ a.c{display:block;text-decoration:none;color:inherit}
 .c-name .kr{font-size:9px;color:var(--text-m);opacity:.5}
 .c-session{font-size:8px;padding:2px 5px;border-radius:4px;font-weight:600;flex-shrink:0}
 .c-session.live{background:var(--green-bg);color:var(--green)}
+.c-session.nxt{background:var(--amber-bg);color:var(--amber)}
 .c-session.closed{background:var(--bg-muted);color:var(--text-m)}
 .c-val{font-size:18px;font-weight:800;letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1.2;margin-bottom:2px}
 .c-chg{display:flex;align-items:center;gap:5px;font-size:10px;font-weight:600;font-variant-numeric:tabular-nums}
@@ -353,7 +366,8 @@ a.rank-row{text-decoration:none;color:inherit}
     <span class="badge closed" id="badge"><span class="dot"></span><span id="badgeTxt">--</span></span>
   </div>
   <div class="hdr-r">
-    <span class="clock" id="clock">--:--:-- KST</span>
+    <span class="clock" id="clock">--:--:--</span>
+    <span class="clock" id="updated" style="opacity:.5">갱신: --:--</span>
     <button class="btn-r" id="rbtn" onclick="load()">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
     </button>
@@ -520,7 +534,7 @@ function render(d){
   if(d.kospiFutures)rFutures(d.kospiFutures);
   if(d.fearGreed)rFearGreed(d.fearGreed);
   rCards('futIdx',inds.filter(i=>['NQ=F','ES=F'].includes(i.symbol)),false);
-  rCards('coreIdx',inds.filter(i=>['KRW=X','GC=F','CL=F','^VIX','DX-Y.NYB'].includes(i.symbol)),false);
+  rCards('coreIdx',inds.filter(i=>['KRW=X','GC=F','CL=F','^VIX','DX-Y.NYB','SPREAD'].includes(i.symbol)),false);
   rCards('stockIdx',inds.filter(i=>['005930.KS','000660.KS','028050.KS'].includes(i.symbol)),false);
   rCards('krRelIdx',inds.filter(i=>['EWY','KORU','BTC-KRW'].includes(i.symbol)),false);
 }
@@ -582,11 +596,22 @@ function rStatus(closed,session){
 }
 
 function rClock(iso){
-  if(!iso)return;
-  const d=new Date(iso),k=new Date(d.getTime()+9*36e5);
+  // Update "last updated" time from API
+  if(iso){
+    const d=new Date(iso),k=new Date(d.getTime()+9*36e5);
+    document.getElementById('updated').textContent=
+      '갱신 '+[k.getUTCHours(),k.getUTCMinutes()].map(v=>String(v).padStart(2,'0')).join(':');
+  }
+}
+
+// Live KST clock
+function tickClock(){
+  const n=new Date();
+  const k=new Date(n.getTime()+9*36e5);
   document.getElementById('clock').textContent=
     [k.getUTCHours(),k.getUTCMinutes(),k.getUTCSeconds()].map(v=>String(v).padStart(2,'0')).join(':')+' KST';
 }
+setInterval(tickClock,1000);tickClock();
 
 function rCards(id,items,lg){
   const el=document.getElementById(id);
@@ -599,7 +624,10 @@ function mkCard(d,lg){
   const arr=d.change>0?'▲':d.change<0?'▼':'';
   const dec=d.price>=10000?0:d.price>=100?2:d.price>=1?2:4;
   const spark=d.sparkline&&d.sparkline.length>2?mkSpark(d.sparkline,dir):'';
-  const session=d.marketClosed?'<span class="c-session closed">마감</span>':'<span class="c-session live">LIVE</span>';
+  const st=d.sessionType;
+  const session=st==='nxt'?'<span class="c-session nxt">NXT</span>'
+    :d.marketClosed?'<span class="c-session closed">마감</span>'
+    :'<span class="c-session live">LIVE</span>';
   const link=cardLink(d.symbol);
   const tag=link?'a href="'+link+'" target="_blank" rel="noopener"':'div';
   const etag=link?'a':'div';
