@@ -20,21 +20,32 @@ export default {
         });
       }
       if (p === '/api/market') {
-        // Fetch index-board + Samsung E&A in parallel
-        const [ibRes, seaRes] = await Promise.all([
+        // Yahoo Finance symbols to fetch (not in index-board)
+        const yfSymbols = [
+          { symbol: '028050.KS', name: 'Samsung E&A', nameKr: '삼성E&A', category: 'stock' },
+          { symbol: '000660.KS', name: 'SK Hynix', nameKr: 'SK하이닉스', category: 'stock' },
+          { symbol: 'BZ=F', name: 'Brent Crude', nameKr: '브렌트유', category: 'commodity' },
+        ];
+        const [ibRes, ...yfResults] = await Promise.all([
           fetch(`${API_BASE}/api/market`, {
             headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
           }),
-          fetch(`${YAHOO_BASE}/028050.KS?interval=1d&range=5d`, {
-            headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
-          }).catch(() => null),
+          ...yfSymbols.map(s =>
+            fetch(`${YAHOO_BASE}/${s.symbol}?interval=1d&range=5d`, {
+              headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
+            }).catch(() => null)
+          ),
         ]);
         let data;
         try { data = await ibRes.json(); } catch { data = {}; }
-        // Merge Samsung E&A
-        if (seaRes && seaRes.ok) {
+        if (!data.indicators) data.indicators = [];
+        // Merge Yahoo Finance data
+        for (let idx = 0; idx < yfSymbols.length; idx++) {
+          const res = yfResults[idx];
+          const info = yfSymbols[idx];
+          if (!res || !res.ok) continue;
           try {
-            const yf = await seaRes.json();
+            const yf = await res.json();
             const meta = yf?.chart?.result?.[0]?.meta;
             const closes = yf?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
             if (meta && closes) {
@@ -42,20 +53,15 @@ export default {
               const prev = meta.chartPreviousClose || meta.previousClose;
               const chg = price - prev;
               const chgPct = prev ? (chg / prev) * 100 : 0;
-              const spark = closes.filter(v => v != null);
-              const seaIndicator = {
-                symbol: '028050.KS',
-                name: 'Samsung E&A',
-                nameKr: '삼성E&A',
+              data.indicators.push({
+                symbol: info.symbol, name: info.name, nameKr: info.nameKr,
                 price, change: chg, changePercent: chgPct,
-                sparkline: spark,
-                category: 'stock',
+                sparkline: closes.filter(v => v != null),
+                category: info.category,
                 marketClosed: meta.currentTradingPeriod?.regular ? Date.now() / 1000 > meta.currentTradingPeriod.regular.end : true,
-              };
-              if (!data.indicators) data.indicators = [];
-              data.indicators.push(seaIndicator);
+              });
             }
-          } catch (e) { /* ignore parse errors */ }
+          } catch (e) { /* ignore */ }
         }
         return new Response(JSON.stringify(data), {
           headers: { 'Content-Type': 'application/json;charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=15' },
@@ -401,7 +407,7 @@ button{font-family:var(--font);cursor:pointer}
 
   <section class="sec">
     <div class="sec-h"><span class="sec-t">개별 종목</span></div>
-    <div class="g g2" id="stockIdx"></div>
+    <div class="g g3" id="stockIdx"></div>
   </section>
 
   <section class="sec">
@@ -472,7 +478,6 @@ function initTabs(){
         if(el)el.classList.toggle('on',p===t);
       });
       if(t==='forecast'&&!MX)loadMatrix();
-      if(t==='global'&&D)renderGlobal(D);
     });
   });
 }
@@ -484,8 +489,7 @@ async function load(){
     if(!r.ok)throw new Error(r.status);
     D=await r.json();
     render(D);
-    // Also render global if visible
-    if(document.getElementById('p-global').classList.contains('on'))renderGlobal(D);
+    renderGlobal(D);
   }catch(e){console.error('Load error:',e)}
   finally{b.classList.remove('spin')}
 }
@@ -528,8 +532,8 @@ function render(d){
   const coreOther=inds.filter(i=>coreSymbols.includes(i.symbol));
   rCards('coreIdx',coreOther,false);
 
-  // Individual stocks: Samsung Electronics + Samsung E&A
-  const stockSymbols=['005930.KS','028050.KS'];
+  // Individual stocks: Samsung Electronics + SK Hynix + Samsung E&A
+  const stockSymbols=['005930.KS','000660.KS','028050.KS'];
   const stocks=inds.filter(i=>stockSymbols.includes(i.symbol));
   rCards('stockIdx',stocks,false);
 
@@ -541,15 +545,15 @@ function render(d){
 function renderGlobal(d){
   const inds=d.indicators||[];
 
-  // Global indices: VIX, Nikkei, Shanghai, SOX, MSCI EM
-  const glSymbols=['^VIX','^N225','000001.SS','^SOX','EEM'];
+  // Global indices: VIX, Nikkei, Shanghai, SOX, MSCI EM, DXY
+  const glSymbols=['^VIX','NKD=F','^N225','000001.SS','^SOX','EEM','DX-Y.NYB'];
   const gl=inds.filter(i=>glSymbols.includes(i.symbol));
   // Also pick up any 'global' category items
   const glCat=inds.filter(i=>i.category==='global'&&!glSymbols.includes(i.symbol));
   rCards('glIdx',[...gl,...glCat],false);
 
-  // Commodities: Gold, Silver, Copper, Nat Gas, WTI
-  const cmdSymbols=['GC=F','SI=F','HG=F','NG=F','CL=F'];
+  // Commodities: Gold, Silver, Copper, Nat Gas, WTI, Brent
+  const cmdSymbols=['GC=F','SI=F','HG=F','NG=F','CL=F','BZ=F'];
   const cmd=inds.filter(i=>cmdSymbols.includes(i.symbol));
   const cmdCat=inds.filter(i=>i.category==='commodity'&&!cmdSymbols.includes(i.symbol));
   rCards('cmdIdx',[...cmd,...cmdCat],false);
