@@ -208,17 +208,19 @@ export default {
             binEth = { price: parseFloat(d.lastPrice), changePct: parseFloat(d.priceChangePercent), volume: parseFloat(d.quoteVolume) };
           }
 
-          // Parse index-board for NQ, ES, KOSPI
-          let nqChange = 0, esChange = 0, fridayClose = 2650;
+          // Parse index-board for NQ, ES, KOSPI, KRW=X
+          let nqChange = 0, esChange = 0, fridayClose = 2650, officialFx = 1450;
           if (ibRes && ibRes.ok) {
             const ibData = await ibRes.json();
             const inds = ibData.indicators || [];
             const nq = inds.find(i => i.symbol === 'NQ=F');
             const es = inds.find(i => i.symbol === 'ES=F');
             const ks = inds.find(i => i.symbol === '^KS11');
+            const fx = inds.find(i => i.symbol === 'KRW=X');
             if (nq && nq.changePercent) nqChange = nq.changePercent / 100;
             if (es && es.changePercent) esChange = es.changePercent / 100;
             if (ks && ks.price) fridayClose = ks.price;
+            if (fx && fx.price) officialFx = fx.price;
           }
 
           // Crypto changes (24h)
@@ -234,20 +236,35 @@ export default {
           const synthChange = synthetic - fridayClose;
           const synthChangePct = fridayClose ? (synthChange / fridayClose) * 100 : 0;
 
-          // USDT Premium
+          // Stablecoin data
           const usdtKrw = upbit['KRW-USDT'] ? upbit['KRW-USDT'].price : null;
           const usdcKrw = upbit['KRW-USDC'] ? upbit['KRW-USDC'].price : null;
-          // official FX: approximate from index-board KRW=X or fallback
-          let officialFx = 1450;
-          if (ibRes && ibRes.ok) {
-            // re-parse not needed, already have ibData above — use a rough value
-          }
           const premium = usdtKrw ? ((usdtKrw / officialFx) - 1) * 100 : null;
 
           // Kimchi premium: (BTC_KRW / (BTC_USD * FX)) - 1
           const btcKrw = upbit['KRW-BTC'] ? upbit['KRW-BTC'].price : null;
           const btcUsd = binBtc.price || null;
           const kimchiPremium = (btcKrw && btcUsd && officialFx) ? ((btcKrw / (btcUsd * officialFx)) - 1) * 100 : null;
+
+          // sKRW — synthetic KRW stablecoin
+          // Fair value: weighted average of USDT/KRW, USDC/KRW, and FX-derived price
+          const sources = [];
+          if (usdtKrw) sources.push({ name: 'USDT/KRW', price: usdtKrw, weight: 0.4 });
+          if (usdcKrw) sources.push({ name: 'USDC/KRW', price: usdcKrw, weight: 0.3 });
+          if (officialFx) sources.push({ name: 'USD/KRW (FX)', price: officialFx, weight: 0.3 });
+          // Normalize weights
+          const totalW = sources.reduce((s, x) => s + x.weight, 0);
+          const fairValue = totalW > 0 ? sources.reduce((s, x) => s + x.price * (x.weight / totalW), 0) : officialFx;
+          // Peg deviation from official FX
+          const pegDeviation = officialFx ? ((fairValue / officialFx) - 1) * 100 : 0;
+          // Stability score: 100 = perfect peg, drops as deviation increases
+          const stabilityScore = Math.max(0, Math.round(100 - Math.abs(pegDeviation) * 20));
+          // Implied collateral ratio from crypto reserves
+          const btcReserveKrw = btcKrw || 0;
+          const ethReserveKrw = upbit['KRW-ETH'] ? upbit['KRW-ETH'].price : 0;
+          // Spread: max - min of sources
+          const srcPrices = sources.map(x => x.price);
+          const spread = srcPrices.length >= 2 ? Math.max(...srcPrices) - Math.min(...srcPrices) : 0;
 
           return json({
             synthetic: { price: Math.round(synthetic * 100) / 100, change: Math.round(synthChange * 100) / 100, changePct: Math.round(synthChangePct * 100) / 100 },
@@ -262,6 +279,14 @@ export default {
               usdc: usdcKrw,
               premium: premium != null ? Math.round(premium * 100) / 100 : null,
               kimchiPremium: kimchiPremium != null ? Math.round(kimchiPremium * 100) / 100 : null,
+            },
+            skrw: {
+              fairValue: Math.round(fairValue * 100) / 100,
+              officialFx: Math.round(officialFx * 100) / 100,
+              pegDeviation: Math.round(pegDeviation * 100) / 100,
+              stabilityScore,
+              spread: Math.round(spread * 100) / 100,
+              sources: sources.map(s => ({ name: s.name, price: Math.round(s.price * 100) / 100, weight: Math.round(s.weight / totalW * 100) })),
             },
             fridayClose,
             weights: { btc: 0.3, eth: 0.1, nq: 0.4, es: 0.2 },
@@ -308,7 +333,7 @@ const HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
 <title>KOSPI 선행지표 대시보드</title>
 <meta name="description" content="코스피 선행지표 실시간 모니터링">
-<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#09090b">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>📊</text></svg>">
@@ -574,6 +599,71 @@ a.geo-evt{text-decoration:none;color:inherit}
 }
 .paper-reset:hover{border-color:var(--border-l);color:var(--text-s)}
 
+/* sKRW Stablecoin */
+.skrw-hero{
+  background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px;position:relative;overflow:hidden;
+}
+.skrw-hero::before{
+  content:'';position:absolute;top:0;right:0;width:120px;height:120px;
+  background:radial-gradient(circle,rgba(168,85,247,.08) 0%,transparent 70%);
+  pointer-events:none;
+}
+.skrw-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.skrw-badge{
+  display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;
+  padding:3px 10px;border-radius:100px;background:var(--purple-bg);color:var(--purple);
+}
+.skrw-badge .dot{width:5px;height:5px;border-radius:50%;background:var(--purple);animation:blink 1.8s infinite}
+.skrw-stability{font-size:10px;font-weight:700;padding:3px 10px;border-radius:100px}
+.skrw-main{display:flex;align-items:baseline;gap:12px;margin-bottom:8px}
+.skrw-price{font-size:36px;font-weight:900;letter-spacing:-.04em;line-height:1}
+.skrw-unit{font-size:14px;font-weight:600;color:var(--text-m)}
+.skrw-peg{font-size:12px;font-weight:700;margin-bottom:10px}
+.skrw-bar{height:6px;border-radius:3px;background:var(--bg-muted);position:relative;margin-bottom:12px}
+.skrw-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.skrw-sources{display:flex;gap:8px;flex-wrap:wrap}
+.skrw-src{
+  flex:1;min-width:100px;background:var(--bg-muted);border-radius:8px;padding:8px 10px;
+  font-size:10px;text-align:center;
+}
+.skrw-src-name{font-weight:600;color:var(--text-m);margin-bottom:2px}
+.skrw-src-price{font-size:14px;font-weight:800;font-variant-numeric:tabular-nums}
+.skrw-src-weight{font-size:8px;color:var(--text-m);margin-top:1px}
+.skrw-stats{display:flex;gap:12px;margin-top:12px;font-size:10px}
+.skrw-stat{flex:1;text-align:center;padding:6px;background:var(--bg-muted);border-radius:6px}
+.skrw-stat-label{font-weight:600;color:var(--text-m);margin-bottom:1px}
+.skrw-stat-val{font-size:14px;font-weight:800;font-variant-numeric:tabular-nums}
+
+/* Mint/Burn */
+.mint-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+.mint-balance{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.mint-bal-item{text-align:center}
+.mint-bal-label{font-size:9px;font-weight:600;color:var(--text-m)}
+.mint-bal-val{font-size:18px;font-weight:900;font-variant-numeric:tabular-nums}
+.mint-actions{display:flex;gap:8px;margin-bottom:10px}
+.mint-input{
+  flex:1;background:var(--bg-muted);border:1px solid var(--border);border-radius:8px;
+  padding:10px 12px;color:var(--text);font-family:var(--font);font-size:14px;
+  font-weight:700;font-variant-numeric:tabular-nums;
+}
+.mint-input:focus{outline:none;border-color:var(--purple)}
+.mint-input::placeholder{color:var(--text-m);font-weight:400}
+.mint-btn{
+  border:none;border-radius:8px;padding:10px 16px;font-size:12px;font-weight:800;
+  color:#fff;transition:.15s;white-space:nowrap;
+}
+.mint-btn:active{transform:scale(.97)}
+.mint-btn.mint{background:var(--purple)}
+.mint-btn.burn{background:#ef4444}
+.mint-btn:disabled{opacity:.4;cursor:not-allowed}
+.mint-history{margin-top:8px}
+.mint-hist-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:5px 8px;font-size:10px;color:var(--text-m);border-bottom:1px solid var(--border);
+}
+.mint-hist-row:last-child{border-bottom:none}
+
 /* Panel */
 .panel{display:none}.panel.on{display:block}
 
@@ -720,6 +810,14 @@ a.geo-evt{text-decoration:none;color:inherit}
   <section class="sec">
     <div class="sec-h"><span class="sec-t">합성 KOSPI 주말 지수</span></div>
     <div id="synthBox"><div class="sk sk-card" style="height:160px"></div></div>
+  </section>
+  <section class="sec">
+    <div class="sec-h"><span class="sec-t">sKRW 합성 원화 스테이블코인</span><span class="sec-sub">실시간</span></div>
+    <div id="skrwBox"><div class="sk sk-card" style="height:120px"></div></div>
+  </section>
+  <section class="sec">
+    <div class="sec-h"><span class="sec-t">sKRW 민팅 / 소각</span><span class="sec-sub">페이퍼</span></div>
+    <div id="skrwMintBox"></div>
   </section>
   <section class="sec">
     <div class="sec-h"><span class="sec-t">스테이블코인 원화</span></div>
@@ -1019,6 +1117,10 @@ function renderWeekend(data){
   }
   stEl.innerHTML=stH||'<div style="color:var(--text-m);font-size:11px;padding:10px">데이터 없음</div>';
 
+  // sKRW Stablecoin
+  renderSkrw(data.skrw);
+  renderSkrwMint(data.skrw);
+
   // Crypto
   const crypto=data.crypto||[];
   const cEl=document.getElementById('cryptoBox');
@@ -1141,8 +1243,143 @@ function renderPaper(currentPrice){
     +'<div style="font-size:9px;color:var(--text-m);margin-bottom:8px">1계약 = 합성KOSPI 1pt × 250,000원 | 증거금 500만원</div>'
     +(posHtml?'<div class="paper-pos">'+posHtml+'</div>':'')
     +(histHtml?'<div class="paper-history" style="margin-top:8px"><div style="font-size:10px;font-weight:700;color:var(--text-m);margin-bottom:4px">최근 거래</div>'+histHtml+'</div>':'')
-    +'<button class="paper-reset" onclick="if(confirm(\'초기화하시겠습니까?\'))resetPaper()">초기화</button>'
+    +'<button class="paper-reset" onclick="confirmReset()">초기화</button>'
     +'</div>';
+}
+
+// =================== sKRW STABLECOIN ===================
+const SKRW_KEY='skrw_mint_v1';
+function getSkrw(){
+  try{const raw=localStorage.getItem(SKRW_KEY);if(raw)return JSON.parse(raw)}catch(e){}
+  return{usdtBalance:10000,skrwBalance:0,history:[]};
+}
+function saveSkrw(s){try{localStorage.setItem(SKRW_KEY,JSON.stringify(s))}catch(e){}}
+
+function renderSkrw(skrw){
+  const el=document.getElementById('skrwBox');
+  if(!el)return;
+  if(!skrw||!skrw.fairValue){
+    el.innerHTML='<div style="text-align:center;color:var(--text-m);padding:20px">sKRW 데이터 로딩 중...</div>';
+    return;
+  }
+  const score=skrw.stabilityScore;
+  const scoreClr=score>=80?'var(--green)':score>=50?'var(--amber)':'var(--up)';
+  const scoreBg=score>=80?'var(--green-bg)':score>=50?'var(--amber-bg)':'var(--up-bg)';
+  const scoreLabel=score>=80?'STABLE':score>=50?'MODERATE':'UNSTABLE';
+  const pegClr=skrw.pegDeviation>0?'var(--up)':'var(--down)';
+  const barW=Math.min(100,score);
+
+  let srcHtml=(skrw.sources||[]).map(s=>
+    '<div class="skrw-src">'
+    +'<div class="skrw-src-name">'+esc(s.name)+'</div>'
+    +'<div class="skrw-src-price">'+fn(s.price,0)+'</div>'
+    +'<div class="skrw-src-weight">'+s.weight+'%</div>'
+    +'</div>'
+  ).join('');
+
+  el.innerHTML='<div class="skrw-hero fi">'
+    +'<div class="skrw-top">'
+    +'<span class="skrw-badge"><span class="dot"></span>sKRW</span>'
+    +'<span class="skrw-stability" style="color:'+scoreClr+';background:'+scoreBg+'">'+scoreLabel+' '+score+'</span>'
+    +'</div>'
+    +'<div class="skrw-main">'
+    +'<span class="skrw-price">'+fn(skrw.fairValue,2)+'</span>'
+    +'<span class="skrw-unit">KRW / 1 sKRW</span>'
+    +'</div>'
+    +'<div class="skrw-peg" style="color:'+pegClr+'">페그 편차: '+(skrw.pegDeviation>0?'+':'')+skrw.pegDeviation.toFixed(2)+'% vs 공식환율 ('+fn(skrw.officialFx,0)+')</div>'
+    +'<div class="skrw-bar"><div class="skrw-bar-fill" style="width:'+barW+'%;background:'+scoreClr+'"></div></div>'
+    +'<div class="skrw-sources">'+srcHtml+'</div>'
+    +'<div class="skrw-stats">'
+    +'<div class="skrw-stat"><div class="skrw-stat-label">스프레드</div><div class="skrw-stat-val">'+fn(skrw.spread,0)+'원</div></div>'
+    +'<div class="skrw-stat"><div class="skrw-stat-label">공식 FX</div><div class="skrw-stat-val">'+fn(skrw.officialFx,0)+'</div></div>'
+    +'<div class="skrw-stat"><div class="skrw-stat-label">안정성</div><div class="skrw-stat-val" style="color:'+scoreClr+'">'+score+'/100</div></div>'
+    +'</div></div>';
+}
+
+function renderSkrwMint(skrw){
+  const el=document.getElementById('skrwMintBox');
+  if(!el)return;
+  const rate=skrw&&skrw.fairValue?skrw.fairValue:1450;
+  const s=getSkrw();
+  const totalValKrw=s.usdtBalance*rate+s.skrwBalance*rate;
+
+  const histHtml=s.history.slice(0,8).map(h=>{
+    const t=new Date(h.timestamp);
+    const ts=[t.getMonth()+1,t.getDate()].join('/')+' '+[t.getHours(),t.getMinutes()].map(v=>String(v).padStart(2,'0')).join(':');
+    const actClr=h.action==='mint'?'var(--purple)':'var(--up)';
+    return '<div class="mint-hist-row">'
+      +'<span style="color:'+actClr+';font-weight:700">'+(h.action==='mint'?'MINT':'BURN')+'</span>'
+      +'<span>'+fn(h.amount,2)+' sKRW</span>'
+      +'<span>'+fn(h.cost,0)+' USDT</span>'
+      +'<span>'+ts+'</span>'
+      +'</div>';
+  }).join('');
+
+  el.innerHTML='<div class="mint-box fi">'
+    +'<div class="mint-balance">'
+    +'<div class="mint-bal-item"><div class="mint-bal-label">USDT 잔고</div><div class="mint-bal-val">'+fn(s.usdtBalance,2)+'</div></div>'
+    +'<div class="mint-bal-item"><div class="mint-bal-label">sKRW 잔고</div><div class="mint-bal-val" style="color:var(--purple)">'+fn(s.skrwBalance,2)+'</div></div>'
+    +'<div class="mint-bal-item"><div class="mint-bal-label">총 가치 (KRW)</div><div class="mint-bal-val">'+fn(totalValKrw,0)+'</div></div>'
+    +'</div>'
+    +'<div style="font-size:10px;color:var(--text-m);margin-bottom:8px">환율: 1 USDT = '+fn(rate,2)+' sKRW</div>'
+    +'<div class="mint-actions">'
+    +'<input class="mint-input" type="number" id="mintAmt" placeholder="USDT 수량" min="1" step="1">'
+    +'<button class="mint-btn mint" onclick="doMint()">MINT</button>'
+    +'<button class="mint-btn burn" onclick="doBurn()">BURN</button>'
+    +'</div>'
+    +'<div style="font-size:9px;color:var(--text-m);margin-bottom:4px">MINT: USDT → sKRW (환율 적용) | BURN: sKRW → USDT (환율 적용) | 수수료 0.1%</div>'
+    +(histHtml?'<div class="mint-history"><div style="font-size:10px;font-weight:700;color:var(--text-m);margin-bottom:4px">민팅 이력</div>'+histHtml+'</div>':'')
+    +'<button class="paper-reset" onclick="confirmSkrwReset()" style="margin-top:8px">초기화</button>'
+    +'</div>';
+}
+
+function doMint(){
+  const input=document.getElementById('mintAmt');
+  if(!input)return;
+  const amt=parseFloat(input.value);
+  if(!amt||amt<=0){alert('USDT 수량을 입력하세요');return}
+  const s=getSkrw();
+  if(amt>s.usdtBalance){alert('USDT 잔고 부족');return}
+  const rate=WKD&&WKD.skrw?WKD.skrw.fairValue:1450;
+  const fee=amt*0.001; // 0.1% fee
+  const net=amt-fee;
+  const skrwAmt=net*rate;
+  s.usdtBalance-=amt;
+  s.skrwBalance+=skrwAmt;
+  s.history.unshift({action:'mint',amount:skrwAmt,cost:amt,rate,fee,timestamp:Date.now()});
+  if(s.history.length>50)s.history=s.history.slice(0,50);
+  saveSkrw(s);
+  input.value='';
+  renderSkrwMint(WKD&&WKD.skrw?WKD.skrw:null);
+}
+
+function doBurn(){
+  const input=document.getElementById('mintAmt');
+  if(!input)return;
+  const amt=parseFloat(input.value);
+  if(!amt||amt<=0){alert('USDT 수량을 입력하세요 (환산될 USDT 양)');return}
+  const s=getSkrw();
+  const rate=WKD&&WKD.skrw?WKD.skrw.fairValue:1450;
+  const skrwNeeded=amt*rate;
+  const fee=skrwNeeded*0.001;
+  if(skrwNeeded+fee>s.skrwBalance){alert('sKRW 잔고 부족 (필요: '+fn(skrwNeeded+fee,2)+' sKRW)');return}
+  s.skrwBalance-=(skrwNeeded+fee);
+  s.usdtBalance+=amt;
+  s.history.unshift({action:'burn',amount:skrwNeeded,cost:amt,rate,fee:fee/rate,timestamp:Date.now()});
+  if(s.history.length>50)s.history=s.history.slice(0,50);
+  saveSkrw(s);
+  input.value='';
+  renderSkrwMint(WKD&&WKD.skrw?WKD.skrw:null);
+}
+
+function confirmReset(){
+  if(confirm('페이퍼 트레이딩을 초기화하시겠습니까?'))resetPaper();
+}
+function confirmSkrwReset(){
+  if(confirm('sKRW 지갑을 초기화하시겠습니까?')){
+    saveSkrw({usdtBalance:10000,skrwBalance:0,history:[]});
+    renderSkrwMint(WKD&&WKD.skrw?WKD.skrw:null);
+  }
 }
 
 // =================== MATRIX ===================
