@@ -1,5 +1,5 @@
 // ============================================================
-// KOSPI Board — Cloudflare Worker (v5)
+// KOSPI Board — Cloudflare Worker (v6)
 // index-board.space 최대 활용 + Naver + Polymarket + Upbit
 // ============================================================
 
@@ -108,6 +108,12 @@ export default {
       }
       if (p === '/api/quiz') {
         return proxy(`${API_BASE}/api/quiz`, 60);
+      }
+      if (p === '/api/nasdaq') {
+        return proxy(`${API_BASE}/api/nasdaq`, 15);
+      }
+      if (p === '/api/nq-briefing') {
+        return proxy(`${API_BASE}/api/briefing/nasdaq`, 30);
       }
 
       // ===== 네이버 테마/업종 =====
@@ -521,6 +527,42 @@ a.geo-evt{text-decoration:none;color:inherit}
 .synth-comp span{display:flex;align-items:center;gap:3px}
 .synth-dot{width:6px;height:6px;border-radius:50%;display:inline-block}
 
+/* Trading */
+.trade-box{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+.trade-bal{font-size:11px;color:var(--text-m);margin-bottom:10px;display:flex;align-items:center;justify-content:space-between}
+.trade-bal b{color:var(--text);font-size:14px;font-weight:800}
+.trade-section{margin-bottom:12px}
+.trade-section-h{font-size:10px;font-weight:700;color:var(--text-m);margin-bottom:6px;display:flex;align-items:center;justify-content:space-between}
+.trade-section-h .price{color:var(--text);font-size:12px;font-weight:800}
+.trade-btns{display:flex;gap:6px}
+.trade-btn{flex:1;padding:10px;border:none;border-radius:8px;font-size:12px;font-weight:700;color:#fff;min-height:44px;transition:.15s}
+.trade-btn.buy{background:#ef4444}.trade-btn.buy:hover{background:#dc2626}
+.trade-btn.sell{background:#3b82f6}.trade-btn.sell:hover{background:#2563eb}
+.trade-btn:disabled{opacity:.3;cursor:not-allowed}
+.trade-pos-item{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:var(--bg-muted);border-radius:6px;margin-bottom:4px;font-size:11px}
+.trade-pos-info{display:flex;flex-direction:column;gap:2px}
+.trade-pos-type{font-weight:700;font-size:10px;text-transform:uppercase}
+.trade-pos-entry{font-size:9px;color:var(--text-m)}
+.trade-pos-pnl{font-weight:800;font-size:13px;font-variant-numeric:tabular-nums}
+.trade-close{background:none;border:1px solid var(--border);color:var(--text-s);border-radius:4px;padding:3px 8px;font-size:9px;font-weight:600;cursor:pointer;min-height:28px}
+.trade-close:hover{border-color:var(--border-l);color:var(--text)}
+.trade-hist{margin-top:8px;max-height:120px;overflow-y:auto}
+.trade-hist-item{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:9px;color:var(--text-m)}
+.trade-reset{background:none;border:1px solid var(--border);color:var(--text-m);border-radius:4px;padding:2px 8px;font-size:8px;cursor:pointer;min-height:24px}
+.trade-reset:hover{border-color:var(--border-l);color:var(--text)}
+
+/* Mag7 / Sector */
+.mag7-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:8px 10px;transition:.15s}
+a.mag7-card{display:block;text-decoration:none;color:inherit}
+.mag7-card:hover{background:var(--bg-card-h)}
+.mag7-sym{font-size:9px;font-weight:800;color:var(--text-m);letter-spacing:.02em;display:flex;align-items:center;gap:4px}
+.mag7-sym .sub{font-weight:500;opacity:.5}
+.mag7-price{font-size:15px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.3;margin:2px 0}
+.mag7-chg{font-size:10px;font-weight:700;font-variant-numeric:tabular-nums}
+.mag7-card.up .mag7-price,.mag7-card.up .mag7-chg{color:var(--up)}
+.mag7-card.down .mag7-price,.mag7-card.down .mag7-chg{color:var(--down)}
+.mag7-card.flat .mag7-price{color:var(--text)}
+
 /* Panel */
 .panel{display:none}.panel.on{display:block}
 
@@ -633,6 +675,18 @@ a.geo-evt{text-decoration:none;color:inherit}
 
 <!-- TAB 2: 글로벌 -->
 <div class="panel" id="p-global">
+  <section class="sec" id="nqBriefSec" style="display:none">
+    <div class="sec-h"><span class="sec-t">NASDAQ AI 브리핑</span></div>
+    <div id="nqBriefBox"></div>
+  </section>
+  <section class="sec">
+    <div class="sec-h"><span class="sec-t">Magnificent 7</span><span class="sec-sub">나스닥</span></div>
+    <div class="g g4" id="mag7Box"><div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div></div>
+  </section>
+  <section class="sec">
+    <div class="sec-h"><span class="sec-t">US 섹터 ETF</span></div>
+    <div class="g g3" id="sectorEtfBox"><div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div></div>
+  </section>
   <section class="sec">
     <div class="sec-h"><span class="sec-t">글로벌 지수</span></div>
     <div class="g g3" id="glIdx"></div>
@@ -681,6 +735,10 @@ a.geo-evt{text-decoration:none;color:inherit}
     <div class="sec-h"><span class="sec-t">합성 KOSPI 주말 지수</span><span class="sec-sub">BTC+NQ+ES+ETH</span></div>
     <div id="synthBox"></div>
   </section>
+  <section class="sec" style="margin-top:4px">
+    <div class="sec-h"><span class="sec-t">가상 트레이딩</span><span class="sec-sub">USDT + KOSPI 선물</span></div>
+    <div id="tradeBox"></div>
+  </section>
 </div>
 
 <footer class="ft">
@@ -709,7 +767,7 @@ a.geo-evt{text-decoration:none;color:inherit}
 </nav>
 
 <script>
-let D=null,MX=null,TH=null,SC=null,GEO=null,STB=null;
+let D=null,MX=null,TH=null,SC=null,GEO=null,STB=null,NQ=null,NQB=null;
 const TABS=['market','global','geo','stable'];
 let stableTimer=null;
 
@@ -722,8 +780,9 @@ function initTabs(){
       b.classList.add('on');
       const t=b.dataset.t;
       TABS.forEach(p=>{const el=document.getElementById('p-'+p);if(el)el.classList.toggle('on',p===t)});
+      if(t==='global'){if(!NQ)loadNasdaq();if(!NQB)loadNqBriefing()}
       if(t==='geo'){if(!GEO)loadGeo();if(!MX)loadMatrix()}
-      if(t==='stable'){loadStable();startStableTimer()}else{stopStableTimer()}
+      if(t==='stable'){loadStable();startStableTimer();renderTrade()}else{stopStableTimer()}
     });
   });
 }
@@ -769,6 +828,12 @@ async function loadGeo(){
 }
 async function loadStable(){
   try{const r=await fetch('/api/stable');if(!r.ok)throw 0;STB=await r.json();renderStable(STB)}catch(e){}
+}
+async function loadNasdaq(){
+  try{const r=await fetch('/api/nasdaq');if(!r.ok)throw 0;NQ=await r.json();renderNasdaq(NQ)}catch(e){}
+}
+async function loadNqBriefing(){
+  try{const r=await fetch('/api/nq-briefing');if(!r.ok)return;const d=await r.json();NQB=d;renderNqBriefing(d)}catch(e){}
 }
 
 // ============ RENDER: 시장 ============
@@ -1021,6 +1086,175 @@ function renderStable(d){
       +'<span><span class="synth-dot" style="background:#3b82f6"></span>ES 20% '+fp2(comp.es)+'</span>'
       +'<span><span class="synth-dot" style="background:#06b6d4"></span>ETH 10% '+fp2(comp.eth)+'</span>'
       +'</div></div>';
+  }
+  renderTrade();
+}
+
+// ============ RENDER: 글로벌 NASDAQ ============
+function renderNasdaq(d){
+  const inds=d.indicators||[];
+  const mag7=inds.filter(i=>i.category==='mag7');
+  if(mag7.length){
+    document.getElementById('mag7Box').innerHTML=mag7.map(s=>{
+      const dir=s.changePercent>0?'up':s.changePercent<0?'down':'flat';
+      const spark=s.sparkline&&s.sparkline.length>2?mkSpark(s.sparkline,dir):'';
+      return '<a class="mag7-card fi '+dir+'" href="https://finance.yahoo.com/quote/'+esc(s.symbol)+'" target="_blank" rel="noopener">'
+        +'<div class="mag7-sym">'+esc(s.symbol)+(s.nameKr?' <span class="sub">'+esc(s.nameKr)+'</span>':'')+'</div>'
+        +'<div class="mag7-price">'+fn(s.price,2)+'</div>'
+        +'<div class="mag7-chg">'+fp(s.changePercent)+'</div>'
+        +spark+'</a>';
+    }).join('');
+  }
+  const sectors=inds.filter(i=>i.category==='sector');
+  if(sectors.length){
+    document.getElementById('sectorEtfBox').innerHTML=sectors.map(s=>{
+      const dir=s.changePercent>0?'up':s.changePercent<0?'down':'flat';
+      return '<a class="mag7-card fi '+dir+'" href="https://finance.yahoo.com/quote/'+esc(s.symbol)+'" target="_blank" rel="noopener">'
+        +'<div class="mag7-sym">'+esc(s.symbol)+' <span class="sub">'+esc(s.nameKr||s.name)+'</span></div>'
+        +'<div class="mag7-price">'+fn(s.price,2)+'</div>'
+        +'<div class="mag7-chg">'+fp(s.changePercent)+'</div></a>';
+    }).join('');
+  }
+}
+function renderNqBriefing(d){
+  if(!d||!d.text)return;
+  document.getElementById('nqBriefSec').style.display='';
+  document.getElementById('nqBriefBox').innerHTML='<div class="brief fi"><div class="brief-text">'+esc(d.text)+'</div>'
+    +(d.generatedAt?'<div class="brief-meta">'+timeAgo(d.generatedAt)+'</div>':'')+'</div>';
+}
+
+// ============ TRADING ============
+const TRADE_KEY='kospi-vt-v1';
+const POINT_VAL=250000;
+const MARGIN=5000000;
+function getTrade(){try{return JSON.parse(localStorage.getItem(TRADE_KEY))||newTrade()}catch(e){return newTrade()}}
+function newTrade(){return{balance:10000000,positions:[],history:[]}}
+function saveTrade(s){localStorage.setItem(TRADE_KEY,JSON.stringify(s))}
+
+function renderTrade(){
+  const box=document.getElementById('tradeBox');
+  if(!box)return;
+  if(!STB){box.innerHTML='<div style="text-align:center;color:var(--text-m);padding:20px;font-size:11px">데이터 로딩중...</div>';return}
+  const s=getTrade();
+  const usdtPrice=STB?.stablecoin?.usdt?.price||0;
+  const synthPrice=STB?.synthetic?.price||0;
+
+  let totalPnl=0;
+  const posHtml=s.positions.map(function(p,i){
+    let pnl=0;
+    if(p.type==='usdt'){
+      pnl=(usdtPrice-p.entry)*p.qty;
+    }else{
+      pnl=p.dir==='long'?(synthPrice-p.entry)*POINT_VAL:(p.entry-synthPrice)*POINT_VAL;
+    }
+    totalPnl+=pnl;
+    const pnlClr=pnl>0?'var(--up)':pnl<0?'var(--down)':'var(--text)';
+    const typeClr=p.dir==='short'?'var(--down)':'var(--up)';
+    const label=p.type==='usdt'?'USDT x'+p.qty:(p.dir==='long'?'KOSPI 롱':'KOSPI 숏');
+    const entryStr=p.type==='usdt'?fn(p.entry,0):fn(p.entry,2);
+    return '<div class="trade-pos-item fi">'
+      +'<div class="trade-pos-info"><span class="trade-pos-type" style="color:'+typeClr+'">'+label+'</span>'
+      +'<span class="trade-pos-entry">진입 '+entryStr+'</span></div>'
+      +'<div style="display:flex;align-items:center;gap:8px">'
+      +'<span class="trade-pos-pnl" style="color:'+pnlClr+'">'+(pnl>0?'+':'')+fn(Math.round(pnl),0)+'</span>'
+      +'<button class="trade-close" onclick="closeTrade('+i+')">청산</button></div></div>';
+  }).join('');
+
+  const histHtml=s.history.slice(-5).reverse().map(function(h){
+    const pnlClr=h.pnl>0?'var(--up)':h.pnl<0?'var(--down)':'var(--text-m)';
+    const d=new Date(h.ts);
+    const ts=(d.getMonth()+1)+'/'+d.getDate()+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+    return '<div class="trade-hist-item"><span>'+esc(h.label)+'</span><span>'+ts+'</span>'
+      +'<span style="color:'+pnlClr+';font-weight:700">'+(h.pnl>0?'+':'')+fn(h.pnl,0)+'</span></div>';
+  }).join('');
+
+  const equity=s.balance+totalPnl;
+  const eqClr=equity>=10000000?'var(--green)':'var(--up)';
+  const canBuyUsdt=usdtPrice>0&&s.balance>=usdtPrice*100;
+  const canFutures=synthPrice>0&&s.balance>=MARGIN;
+  const hasUsdt=s.positions.some(function(p){return p.type==='usdt'});
+  const hasFutures=s.positions.some(function(p){return p.type==='futures'});
+
+  box.innerHTML='<div class="trade-box fi">'
+    +'<div class="trade-bal"><div>잔고 <b>'+fn(s.balance,0)+'</b>원'
+    +(totalPnl?'  평가 <b style="color:'+eqClr+'">'+(totalPnl>0?'+':'')+fn(Math.round(totalPnl),0)+'</b>':'')
+    +'</div><button class="trade-reset" onclick="confirmReset()">초기화</button></div>'
+    +'<div style="display:flex;gap:10px">'
+    +'<div class="trade-section" style="flex:1">'
+    +'<div class="trade-section-h"><span>USDT/KRW</span><span class="price">'+(usdtPrice?fn(usdtPrice,0):'--')+'</span></div>'
+    +'<div class="trade-btns">'
+    +'<button class="trade-btn buy" onclick="buyUsdt()"'+(canBuyUsdt?'':' disabled')+'>매수 100</button>'
+    +'<button class="trade-btn sell" onclick="sellUsdt()"'+(hasUsdt?'':' disabled')+'>전량매도</button>'
+    +'</div></div>'
+    +'<div class="trade-section" style="flex:1">'
+    +'<div class="trade-section-h"><span>KOSPI 선물</span><span class="price">'+(synthPrice?fn(synthPrice,2):'--')+'</span></div>'
+    +'<div class="trade-btns">'
+    +'<button class="trade-btn buy" onclick="buyFutures(\\'long\\')"'+(canFutures&&!hasFutures?'':' disabled')+'>롱</button>'
+    +'<button class="trade-btn sell" onclick="buyFutures(\\'short\\')"'+(canFutures&&!hasFutures?'':' disabled')+'>숏</button>'
+    +'</div></div></div>'
+    +(s.positions.length?'<div style="margin-top:10px">'+posHtml+'</div>':'<div style="text-align:center;color:var(--text-m);font-size:10px;padding:12px">포지션 없음</div>')
+    +(histHtml?'<div class="trade-hist"><div style="font-size:9px;font-weight:700;color:var(--text-m);margin-bottom:4px">최근 거래</div>'+histHtml+'</div>':'')
+    +'<div style="font-size:8px;color:var(--text-m);margin-top:8px;opacity:.5">USDT: 100개 단위 · KOSPI 선물: 1pt=25만원, 증거금 500만원</div>'
+    +'</div>';
+}
+
+function buyUsdt(){
+  const s=getTrade();
+  const price=STB?.stablecoin?.usdt?.price;
+  if(!price)return;
+  const qty=100;
+  const cost=price*qty;
+  if(s.balance<cost)return;
+  s.balance-=cost;
+  s.positions.push({type:'usdt',entry:price,qty:qty,ts:Date.now()});
+  s.history.push({label:'USDT x'+qty+' 매수 @'+fn(price,0),pnl:0,ts:Date.now()});
+  saveTrade(s);renderTrade();
+}
+function sellUsdt(){
+  const s=getTrade();
+  const price=STB?.stablecoin?.usdt?.price;
+  if(!price)return;
+  const idx=s.positions.findIndex(function(p){return p.type==='usdt'});
+  if(idx===-1)return;
+  const p=s.positions[idx];
+  const pnl=Math.round((price-p.entry)*p.qty);
+  s.balance+=Math.round(price*p.qty);
+  s.positions.splice(idx,1);
+  s.history.push({label:'USDT x'+p.qty+' 매도 @'+fn(price,0),pnl:pnl,ts:Date.now()});
+  saveTrade(s);renderTrade();
+}
+function buyFutures(dir){
+  const s=getTrade();
+  const price=STB?.synthetic?.price;
+  if(!price||s.balance<MARGIN)return;
+  if(s.positions.some(function(p){return p.type==='futures'}))return;
+  s.balance-=MARGIN;
+  s.positions.push({type:'futures',dir:dir,entry:price,ts:Date.now()});
+  s.history.push({label:'KOSPI '+(dir==='long'?'롱':'숏')+' @'+fn(price,2),pnl:0,ts:Date.now()});
+  saveTrade(s);renderTrade();
+}
+function closeTrade(idx){
+  const s=getTrade();
+  const p=s.positions[idx];
+  if(!p)return;
+  let pnl=0;
+  if(p.type==='usdt'){
+    const price=STB?.stablecoin?.usdt?.price||p.entry;
+    pnl=Math.round((price-p.entry)*p.qty);
+    s.balance+=Math.round(price*p.qty);
+    s.history.push({label:'USDT x'+p.qty+' 매도 @'+fn(price,0),pnl:pnl,ts:Date.now()});
+  }else{
+    const price=STB?.synthetic?.price||p.entry;
+    pnl=Math.round(p.dir==='long'?(price-p.entry)*POINT_VAL:(p.entry-price)*POINT_VAL);
+    s.balance+=MARGIN+pnl;
+    s.history.push({label:'KOSPI '+(p.dir==='long'?'롱':'숏')+' 청산 @'+fn(price,2),pnl:pnl,ts:Date.now()});
+  }
+  s.positions.splice(idx,1);
+  saveTrade(s);renderTrade();
+}
+function confirmReset(){
+  if(confirm('트레이딩 데이터를 초기화하시겠습니까?')){
+    localStorage.removeItem(TRADE_KEY);renderTrade();
   }
 }
 
