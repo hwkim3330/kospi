@@ -1,0 +1,6 @@
+# CI installs CPU-only torch first (see .github/workflows/forecast.yml)
+timesfm[torch]==3.0.2
+finance-datareader==0.9.202
+holidays
+pandas
+numpy
