@@ -3,7 +3,11 @@
 // index-board.space 최대 활용 + Naver + Polymarket + Upbit
 // ============================================================
 
+import FORECAST_BUNDLED from '../forecast/forecast.json';
+
 const API_BASE = 'https://index-board.space';
+// Daily TimesFM-3 forecast committed by .github/workflows/forecast.yml
+const FORECAST_URL = 'https://raw.githubusercontent.com/hwkim3330/kospi/main/forecast/forecast.json';
 const YAHOO = 'https://query1.finance.yahoo.com/v8/finance/chart';
 const NAVER_POLL = 'https://polling.finance.naver.com/api/realtime/domestic/stock';
 const NAVER_FIN = 'https://finance.naver.com';
@@ -279,6 +283,18 @@ export default {
         } catch (e) {
           return json({ error: e.message }, 10);
         }
+      }
+
+      // ===== TimesFM-3 예측 (GitHub에 매일 커밋되는 JSON, 실패 시 번들 버전) =====
+      if (p === '/api/forecast') {
+        try {
+          const r = await fetch(FORECAST_URL, { cf: { cacheTtl: 1800, cacheEverything: true } });
+          if (r.ok) {
+            const d = await r.json();
+            if (d && d.series) return json(d, 1800);
+          }
+        } catch (e) { /* fall through to bundled copy */ }
+        return json(FORECAST_BUNDLED, 600);
       }
 
       if (p === '/favicon.ico') return new Response(null, { status: 204 });
@@ -597,6 +613,17 @@ a.mag7-card{display:block;text-decoration:none;color:inherit}
 }
 
 .fi{animation:fadein .25s ease}
+/* TimesFM forecast */
+.fc-tabs{display:flex;gap:4px;margin-bottom:6px}
+.fc-tab{background:var(--bg-muted);border:1px solid var(--border);color:var(--text-s);font-size:10px;font-weight:600;padding:3px 9px;border-radius:999px}
+.fc-tab.on{background:var(--text);color:var(--bg);border-color:var(--text)}
+.fc-chart svg{width:100%;height:auto;display:block}
+.fc-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px}
+.fc-k{font-size:9px;color:var(--text-m);font-weight:600}
+.fc-v{font-size:15px;font-weight:800;font-variant-numeric:tabular-nums}
+.fc-r{font-size:10px;color:var(--text-s);font-variant-numeric:tabular-nums}
+.fc-bt{font-size:10px;color:var(--text-m);margin-top:6px;line-height:1.5}
+.fc-warn{font-size:10px;color:var(--amber);background:var(--amber-bg);border-radius:8px;padding:7px 9px;margin-top:6px;line-height:1.5}
 @keyframes fadein{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}
 </style>
 </head>
@@ -638,6 +665,16 @@ a.mag7-card{display:block;text-decoration:none;color:inherit}
   <section class="sec" id="invSec" style="display:none">
     <div class="sec-h"><span class="sec-t">투자자별 매매</span><span class="sec-sub" id="invDate"></span></div>
     <div class="rank-list" id="invBox"></div>
+  </section>
+  <section class="sec" id="fcSec" style="display:none">
+    <div class="sec-h"><span class="sec-t">AI 예측 밴드</span><span class="sec-sub" id="fcMeta">TimesFM-3</span></div>
+    <div class="c">
+      <div class="fc-tabs" id="fcTabs"></div>
+      <div class="fc-chart" id="fcChart"></div>
+      <div class="fc-stats" id="fcStats"></div>
+      <div class="fc-bt" id="fcBt"></div>
+      <div class="fc-warn">⚠️ 투자 권유가 아닙니다. Google TimesFM-3 모델이 과거 종가만 보고 낸 통계적 추정이며, 실제 가격은 음영 구간(q10–q90) 밖으로 자주 벗어납니다(아래 백테스트 적중률 참고). 모델 가중치는 비상업·비운영 용도 한정 라이선스(timesfm-non-commercial-license-v1.0)로, 이 화면은 개인 연구용 실험입니다. 투자 판단과 손실 책임은 이용자 본인에게 있습니다.</div>
+    </div>
   </section>
   <section class="sec">
     <div class="sec-h"><span class="sec-t">선물</span></div>
@@ -742,7 +779,7 @@ a.mag7-card{display:block;text-decoration:none;color:inherit}
 </div>
 
 <footer class="ft">
-  <p>투자 참고용 · 손실은 투자자 본인에게 귀속</p>
+  <p>투자 참고용 · 손실은 투자자 본인에게 귀속 · AI 예측: Google TimesFM-3 (비상업 라이선스)</p>
   <p style="margin-top:3px;opacity:.5">index-board.space · Naver · Polymarket · Upbit · Binance · 30초 갱신</p>
 </footer>
 </div>
@@ -767,11 +804,11 @@ a.mag7-card{display:block;text-decoration:none;color:inherit}
 </nav>
 
 <script>
-let D=null,MX=null,TH=null,SC=null,GEO=null,STB=null,NQ=null,NQB=null;
+let D=null,MX=null,TH=null,SC=null,GEO=null,STB=null,NQ=null,NQB=null,FC=null,FC_KEY=null;
 const TABS=['market','global','geo','stable'];
 let stableTimer=null;
 
-document.addEventListener('DOMContentLoaded',()=>{load();setInterval(load,30000);initTabs()});
+document.addEventListener('DOMContentLoaded',()=>{load();setInterval(load,30000);initTabs();loadForecast()});
 
 function initTabs(){
   document.getElementById('tabBar').querySelectorAll('.tab').forEach(b=>{
@@ -798,6 +835,47 @@ async function load(){
     loadBriefing();loadInvestor();loadNews();loadWeekly();
   }catch(e){console.error(e)}
   finally{b.classList.remove('spin')}
+}
+
+async function loadForecast(){
+  try{const r=await fetch('/api/forecast');if(!r.ok)return;FC=await r.json();renderForecast()}catch(e){}
+}
+function renderForecast(){
+  if(!FC||!FC.series)return;
+  const keys=Object.keys(FC.series);if(!keys.length)return;
+  if(!FC_KEY||!FC.series[FC_KEY])FC_KEY=keys[0];
+  document.getElementById('fcSec').style.display='';
+  document.getElementById('fcTabs').innerHTML=keys.map(k=>'<button class="fc-tab'+(k===FC_KEY?' on':'')+'" onclick="FC_KEY=&quot;'+k+'&quot;;renderForecast()">'+esc(FC.series[k].name)+'</button>').join('');
+  const s=FC.series[FC_KEY],f=s.forecast,dg=FC_KEY==='KOSPI'?2:0;
+  const gen=FC.generated_at?new Date(FC.generated_at):null;
+  document.getElementById('fcMeta').textContent=(FC.model_version||'TimesFM')+' · '+s.last_date+' 종가 기준'+(gen?' · '+(gen.getMonth()+1)+'/'+gen.getDate()+' 생성':'');
+  const H=s.history.slice(-60),hv=H.map(x=>x[1]);
+  const all=hv.concat(f.q10,f.q90),mn=Math.min(...all),mx=Math.max(...all),rng=mx-mn||1;
+  const n=H.length+f.median.length,w=600,h=170,pl=4,pr=52,pt=8,pb=16;
+  const X=i=>pl+i/(n-1)*(w-pl-pr),Y=v=>pt+(1-(v-mn)/rng)*(h-pt-pb);
+  const o=H.length-1;
+  const hp=hv.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+  const band=[X(o).toFixed(1)+','+Y(hv[o]).toFixed(1)].concat(f.q90.map((v,i)=>X(o+1+i).toFixed(1)+','+Y(v).toFixed(1)),f.q10.map((v,i)=>X(o+1+i).toFixed(1)+','+Y(v).toFixed(1)).reverse()).join(' ');
+  const mp=[X(o).toFixed(1)+','+Y(hv[o]).toFixed(1)].concat(f.median.map((v,i)=>X(o+1+i).toFixed(1)+','+Y(v).toFixed(1))).join(' ');
+  const lab=(v,c)=>'<text x="'+(w-pr+4)+'" y="'+(Y(v)+3).toFixed(1)+'" font-size="10" fill="'+c+'">'+fn(v,dg)+'</text>';
+  const x5=X(o+5).toFixed(1);
+  document.getElementById('fcChart').innerHTML='<svg viewBox="0 0 '+w+' '+h+'" role="img" aria-label="예측 밴드 차트">'
+    +'<line x1="'+X(o).toFixed(1)+'" y1="'+pt+'" x2="'+X(o).toFixed(1)+'" y2="'+(h-pb)+'" stroke="#3f3f46" stroke-dasharray="3 3"/>'
+    +'<line x1="'+x5+'" y1="'+pt+'" x2="'+x5+'" y2="'+(h-pb)+'" stroke="#3f3f46" stroke-dasharray="1 3"/>'
+    +'<polygon points="'+band+'" fill="#a855f7" fill-opacity=".18"/>'
+    +'<polyline points="'+hp+'" fill="none" stroke="#fafafa" stroke-width="1.5"/>'
+    +'<polyline points="'+mp+'" fill="none" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="4 3"/>'
+    +lab(f.q90[f.q90.length-1],'#a1a1aa')+lab(f.median[f.median.length-1],'#a855f7')+lab(f.q10[f.q10.length-1],'#a1a1aa')
+    +'<text x="'+pl+'" y="'+(h-3)+'" font-size="10" fill="#71717a">'+H[0][0]+'</text>'
+    +'<text x="'+(X(o)-4).toFixed(1)+'" y="'+(h-3)+'" font-size="10" fill="#71717a" text-anchor="end">'+s.last_date+'</text>'
+    +'<text x="'+(X(n-1)).toFixed(1)+'" y="'+(h-3)+'" font-size="10" fill="#71717a" text-anchor="end">+20일</text>'
+    +'</svg>';
+  const st=(k,label)=>{const x=s[k];if(!x)return'';const c=x.median_change_pct>0?'var(--up)':x.median_change_pct<0?'var(--down)':'var(--flat)';
+    return '<div><div class="fc-k">'+label+' ('+x.date+') 중앙값</div><div class="fc-v">'+fn(x.median,dg)+' <span style="font-size:11px;color:'+c+'">'+fp(x.median_change_pct)+'</span></div>'
+      +'<div class="fc-r">80% 구간 '+fn(x.q10,dg)+' ~ '+fn(x.q90,dg)+'</div></div>'};
+  document.getElementById('fcStats').innerHTML=st('h5','5거래일')+st('h20','20거래일');
+  const b=s.backtest;
+  document.getElementById('fcBt').innerHTML=b?('백테스트 '+b.window.start+'~'+b.window.end+' ('+b.h5.n+'회): q10–q90 적중률 5일 '+Math.round(b.h5.coverage_q10_q90*100)+'% · 20일 '+Math.round(b.h20.coverage_q10_q90*100)+'% (목표 80%) · 20일 오차 '+b.h20.mape_median_pct+'% (단순 “현재가 유지” '+b.h20.mape_naive_pct+'%)'):'';
 }
 
 async function loadBriefing(){
