@@ -672,13 +672,15 @@ a.mag7-card{display:block;text-decoration:none;color:inherit}
     <div class="rank-list" id="invBox"></div>
   </section>
   <section class="sec" id="fcSec" style="display:none">
-    <div class="sec-h"><span class="sec-t">AI 예측 밴드</span><span class="sec-sub" id="fcMeta">TimesFM-3</span></div>
+    <div class="sec-h"><span class="sec-t">AI 예측 밴드</span><span class="sec-sub" id="fcMeta"></span></div>
     <div class="c">
       <div class="fc-tabs" id="fcTabs"></div>
+      <div class="fc-tabs"><button class="fc-tab" id="fcTfmBtn" onclick="runTimesFM()">TimesFM 2.5 (WebGPU)</button></div>
+      <div class="fc-bt" id="fcTfmSt" style="margin-top:0">TimesFM 2.5 (200M, 8-bit, 약 261MB 1회 다운로드 후 캐시) · 서버가 아닌 내 브라우저에서 로컬 실행 · 투자 권유 아님</div>
       <div class="fc-chart" id="fcChart"></div>
       <div class="fc-stats" id="fcStats"></div>
       <div class="fc-bt" id="fcBt"></div>
-      <div class="fc-warn">⚠️ 투자 권유가 아닙니다. Google TimesFM-3 모델이 과거 종가만 보고 낸 통계적 추정이며, 실제 가격은 음영 구간(q10–q90) 밖으로 자주 벗어납니다(아래 백테스트 적중률 참고). 모델 가중치는 비상업·비운영 용도 한정 라이선스(timesfm-non-commercial-license-v1.0)로, 이 화면은 개인 연구용 실험입니다. 투자 판단과 손실 책임은 이용자 본인에게 있습니다.</div>
+      <div class="fc-warn">⚠️ 투자 권유가 아닙니다. 과거 종가만 보고 낸 통계적 추정이며, 실제 가격은 음영 구간(q10–q90) 밖으로 자주 벗어납니다. 투자 판단과 손실 책임은 이용자 본인에게 있습니다.</div>
     </div>
   </section>
   <section class="sec">
@@ -809,7 +811,7 @@ a.mag7-card{display:block;text-decoration:none;color:inherit}
 </nav>
 
 <script>
-let D=null,MX=null,TH=null,SC=null,GEO=null,STB=null,NQ=null,NQB=null,FC=null,FC_KEY=null;
+let D=null,MX=null,TH=null,SC=null,GEO=null,STB=null,NQ=null,NQB=null,FC=null,FC_KEY=null,FC_EWMA=null,FC_TFM=null,TFM_BUSY=0;
 const TABS=['market','global','geo','stable'];
 let stableTimer=null;
 
@@ -843,7 +845,29 @@ async function load(){
 }
 
 async function loadForecast(){
-  try{const r=await fetch('/api/history');if(!r.ok)return;const d=await r.json();FC=buildForecast(d);renderForecast()}catch(e){console.error(e)}
+  try{const r=await fetch('/api/history');if(!r.ok)return;const d=await r.json();FC=FC_EWMA=buildForecast(d);if(FC_TFM){FC_TFM=null;document.getElementById('fcTfmBtn').classList.remove('on');document.getElementById('fcTfmSt').textContent='데이터 갱신됨 · 다시 누르면 TimesFM 재계산(캐시된 모델 사용)'}renderForecast()}catch(e){console.error(e)}
+}
+/* 선택: TimesFM 2.5 200M (Apache-2.0, ONNX 8-bit)를 브라우저에서 실행 — https://github.com/hwkim3330/timesfm-web */
+const TFM_BASE='https://hwkim3330.github.io/timesfm-web/';
+async function runTimesFM(){
+  const btn=document.getElementById('fcTfmBtn'),st=document.getElementById('fcTfmSt');
+  if(FC_TFM){FC=FC===FC_TFM?FC_EWMA:FC_TFM;btn.classList.toggle('on',FC===FC_TFM);renderForecast();return}
+  if(TFM_BUSY||!FC_EWMA)return;TFM_BUSY=1;
+  try{
+    st.textContent=('gpu' in navigator?'WebGPU':'WebGPU 미지원 → WASM(CPU)')+' · 모델 준비 중…';
+    const {loadTimesFM}=await import(TFM_BASE+'timesfm.js');
+    const t=await loadTimesFM({onProgress:({loaded,total,cached})=>{st.textContent=(cached?'캐시에서 불러오는 중 ':'모델 다운로드 ')+Math.round(loaded/1e6)+' / '+Math.round(total/1e6)+' MB'}});
+    st.textContent='추론 중 ('+t.backend+')…';
+    const keys=Object.keys(FC_EWMA.series),t0=performance.now();
+    const res=await t.forecast(keys.map(k=>FC_EWMA.series[k].history.map(x=>x[1])),20),ms=performance.now()-t0,series={};
+    keys.forEach((k,i)=>{const s=FC_EWMA.series[k],r=res[i],f={dates:s.forecast.dates,median:r.median,q10:r.q[0],q90:r.q[8]};
+      const pt=h=>({date:f.dates[h-1],median:f.median[h-1],q10:f.q10[h-1],q90:f.q90[h-1],median_change_pct:(f.median[h-1]/s.last_close-1)*100});
+      series[k]={...s,forecast:f,h5:pt(5),h20:pt(20),backtest:null}});
+    FC=FC_TFM={model_version:'TimesFM 2.5 ('+t.backend+', 내 브라우저)',generated_at:new Date().toISOString(),series};
+    btn.classList.add('on');
+    st.textContent='TimesFM 2.5 200M · '+Math.round(t.sizeBytes/1e6)+'MB · 내 브라우저에서 로컬 실행('+t.backend+' · 로드 '+(t.loadMs/1000).toFixed(1)+'초 · 추론 '+Math.round(ms)+'ms) · 투자 권유 아님 · 다시 누르면 EWMA';
+    renderForecast();
+  }catch(e){console.error(e);st.textContent='TimesFM 실행 실패: '+e.message}finally{TFM_BUSY=0}
 }
 /* 브라우저에서 계산하는 예측 밴드: EWMA 변동성(λ=0.94), 중앙값=현재가 유지, 80% 구간=±1.2816σ√h */
 function ewmaSigma(lr,lam){let v=0,n=0;for(const r of lr){v=n?lam*v+(1-lam)*r*r:r*r;n++}return Math.sqrt(v)}
