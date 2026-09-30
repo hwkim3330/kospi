@@ -3,11 +3,10 @@
 // index-board.space 최대 활용 + Naver + Polymarket + Upbit
 // ============================================================
 
-import FORECAST_BUNDLED from '../forecast/forecast.json';
 
 const API_BASE = 'https://index-board.space';
-// Daily TimesFM-3 forecast committed by .github/workflows/forecast.yml
-const FORECAST_URL = 'https://raw.githubusercontent.com/hwkim3330/kospi/main/forecast/forecast.json';
+// Forecast band is computed in the browser from daily closes (see /api/history).
+const HISTORY_SYMBOLS = { KOSPI: '코스피', '005930': '삼성전자', '000660': 'SK하이닉스' };
 const YAHOO = 'https://query1.finance.yahoo.com/v8/finance/chart';
 const NAVER_POLL = 'https://polling.finance.naver.com/api/realtime/domestic/stock';
 const NAVER_FIN = 'https://finance.naver.com';
@@ -285,16 +284,22 @@ export default {
         }
       }
 
-      // ===== TimesFM-3 예측 (GitHub에 매일 커밋되는 JSON, 실패 시 번들 버전) =====
-      if (p === '/api/forecast') {
-        try {
-          const r = await fetch(FORECAST_URL, { cf: { cacheTtl: 1800, cacheEverything: true } });
-          if (r.ok) {
-            const d = await r.json();
-            if (d && d.series) return json(d, 1800);
-          }
-        } catch (e) { /* fall through to bundled copy */ }
-        return json(FORECAST_BUNDLED, 600);
+      // ===== 일봉 종가 (예측 밴드는 브라우저에서 계산) =====
+      if (p === '/api/history') {
+        const end = new Date(Date.now() + 9 * 3600e3);
+        const start = new Date(end.getTime() - 800 * 86400e3);
+        const ymd = (d) => d.toISOString().slice(0, 10).replace(/-/g, '');
+        const out = { generated_at: new Date().toISOString(), source: 'Naver Finance daily close', series: {} };
+        await Promise.all(Object.entries(HISTORY_SYMBOLS).map(async ([sym, name]) => {
+          try {
+            const url = `https://fchart.stock.naver.com/siseJson.nhn?symbol=${sym}&requestType=1&startTime=${ymd(start)}&endTime=${ymd(end)}&timeframe=day`;
+            const t = await (await fetch(url, { headers: { 'User-Agent': UA }, cf: { cacheTtl: 900, cacheEverything: true } })).text();
+            const rows = [...t.matchAll(/\["(\d{8})",\s*[\d.]+,\s*[\d.]+,\s*[\d.]+,\s*([\d.]+)/g)]
+              .map((m) => [`${m[1].slice(0, 4)}-${m[1].slice(4, 6)}-${m[1].slice(6)}`, +m[2]]);
+            if (rows.length > 60) out.series[sym] = { name, history: rows };
+          } catch (e) { /* skip symbol */ }
+        }));
+        return json(out, 900);
       }
 
       if (p === '/favicon.ico') return new Response(null, { status: 204 });
@@ -838,7 +843,23 @@ async function load(){
 }
 
 async function loadForecast(){
-  try{const r=await fetch('/api/forecast');if(!r.ok)return;FC=await r.json();renderForecast()}catch(e){}
+  try{const r=await fetch('/api/history');if(!r.ok)return;const d=await r.json();FC=buildForecast(d);renderForecast()}catch(e){console.error(e)}
+}
+/* 브라우저에서 계산하는 예측 밴드: EWMA 변동성(λ=0.94), 중앙값=현재가 유지, 80% 구간=±1.2816σ√h */
+function ewmaSigma(lr,lam){let v=0,n=0;for(const r of lr){v=n?lam*v+(1-lam)*r*r:r*r;n++}return Math.sqrt(v)}
+function nextTradingDays(last,k){const out=[];const d=new Date(last+'T00:00:00Z');while(out.length<k){d.setUTCDate(d.getUTCDate()+1);const w=d.getUTCDay();if(w&&w<6)out.push(d.toISOString().slice(0,10))}return out}
+function bandAt(closes,end,h,lam){const lr=[];for(let i=Math.max(1,end-250);i<=end;i++)lr.push(Math.log(closes[i]/closes[i-1]));const sg=ewmaSigma(lr,lam),c=closes[end],z=1.2816;
+  return{median:c,q10:c*Math.exp(-z*sg*Math.sqrt(h)),q90:c*Math.exp(z*sg*Math.sqrt(h))}}
+function buildForecast(d){const LAM=0.94,H=20,series={};
+  for(const[k,v]of Object.entries(d.series||{})){const hist=v.history,cl=hist.map(x=>x[1]),e=cl.length-1;if(e<120)continue;
+    const dates=nextTradingDays(hist[e][0],H),f={dates,median:[],q10:[],q90:[]};
+    for(let h=1;h<=H;h++){const b=bandAt(cl,e,h,LAM);f.median.push(b.median);f.q10.push(b.q10);f.q90.push(b.q90)}
+    const pt=h=>({date:dates[h-1],median:f.median[h-1],q10:f.q10[h-1],q90:f.q90[h-1],median_change_pct:0});
+    const bt={};for(const h of[5,20]){let hit=0,n=0,ape=0;const start=Math.max(260,e-250);for(let t=start;t+h<=e;t+=5){const b=bandAt(cl,t,h,LAM),y=cl[t+h];n++;if(y>=b.q10&&y<=b.q90)hit++;ape+=Math.abs(y-b.median)/y*100}
+      bt['h'+h]={n,coverage_q10_q90:n?hit/n:0,mape_median_pct:n?+(ape/n).toFixed(2):0,mape_naive_pct:n?+(ape/n).toFixed(2):0}}
+    bt.window={start:hist[Math.max(260,e-250)][0],end:hist[e][0]};
+    series[k]={name:v.name,last_date:hist[e][0],last_close:cl[e],history:hist,forecast:f,h5:pt(5),h20:pt(20),backtest:bt}}
+  return{model_version:'EWMA 변동성 밴드 (브라우저 계산)',generated_at:new Date().toISOString(),series}
 }
 function renderForecast(){
   if(!FC||!FC.series)return;
@@ -875,7 +896,7 @@ function renderForecast(){
       +'<div class="fc-r">80% 구간 '+fn(x.q10,dg)+' ~ '+fn(x.q90,dg)+'</div></div>'};
   document.getElementById('fcStats').innerHTML=st('h5','5거래일')+st('h20','20거래일');
   const b=s.backtest;
-  document.getElementById('fcBt').innerHTML=b?('백테스트 '+b.window.start+'~'+b.window.end+' ('+b.h5.n+'회): q10–q90 적중률 5일 '+Math.round(b.h5.coverage_q10_q90*100)+'% · 20일 '+Math.round(b.h20.coverage_q10_q90*100)+'% (목표 80%) · 20일 오차 '+b.h20.mape_median_pct+'% (단순 “현재가 유지” '+b.h20.mape_naive_pct+'%)'):'';
+  document.getElementById('fcBt').innerHTML=b?('최근 1년 백테스트 '+b.window.start+'~'+b.window.end+': 80% 구간 적중률 5일 '+Math.round(b.h5.coverage_q10_q90*100)+'% ('+b.h5.n+'회) · 20일 '+Math.round(b.h20.coverage_q10_q90*100)+'% ('+b.h20.n+'회) · 목표 80%'):'';
 }
 
 async function loadBriefing(){
